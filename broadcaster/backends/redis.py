@@ -115,6 +115,15 @@ class RedisBackend(BroadcastBackend):
     async def subscribe(self, channel: str) -> None:
         self._channels.add(channel)
         self._has_channels.set()
+        try:
+            await self._subscribe(channel)
+        except BaseException:
+            # Failed or cancelled: Broadcast will not call unsubscribe() for
+            # it, so it must not stay in `_channels` (re-subscribed forever).
+            self._forget(channel)
+            raise
+
+    async def _subscribe(self, channel: str) -> None:
         async with self._lock:
             pubsub = self._pubsub
             if pubsub is not None:
@@ -136,7 +145,6 @@ class RedisBackend(BroadcastBackend):
         # Also stop waiting when the backend is being disconnected.
         await wait_any([self._connected, self._stop], self._SUBSCRIBE_TIMEOUT)
         if self._stop.is_set() or not self._connected.is_set():
-            self._forget(channel)
             if self._stop.is_set():
                 raise ConnectionError(f"Redis backend is disconnecting: could not subscribe to {channel!r}")
             raise ConnectionError(

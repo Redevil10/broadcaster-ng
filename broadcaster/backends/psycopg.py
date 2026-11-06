@@ -34,20 +34,47 @@ async def _with_deadline(conn: Connection, awaitable: Awaitable[T], timeout: flo
     to the server and waits up to 10 s for it, which on a half-open connection
     never arrives. Closing the socket ends the pending query at once; the
     connection is broken anyway.
+
+    If the caller is cancelled, the command is left to finish in the
+    background (the connection may be shared: the LISTEN connection serves
+    every channel), still closing the connection if it overruns the deadline.
     """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
     task = asyncio.ensure_future(awaitable)
     task.add_done_callback(lambda t: t.cancelled() or t.exception())  # retrieve it
     try:
         done, _ = await asyncio.wait({task}, timeout=timeout)
     except asyncio.CancelledError:
-        _kill(conn)
-        await asyncio.wait({task}, timeout=1.0)
+
+        def expire() -> None:
+            if not task.done():
+                _kill(conn)
+
+        watchdog = loop.call_at(deadline, expire)
+        task.add_done_callback(lambda _: watchdog.cancel())
         raise
     if not done:
         _kill(conn)
         await asyncio.wait({task}, timeout=1.0)
         raise TimeoutError(f"no reply from Postgres within {timeout:g} s")
     return task.result()
+
+
+def _check_channel(channel: str) -> None:
+    # Rejected by the server or the driver; caught here so the error is clear.
+    if not channel or "\x00" in channel:
+        raise ValueError(f"invalid Postgres channel name: {channel!r}")
+
+
+def _is_server_error(exc: BaseException, conn: Connection) -> bool:
+    """True if the server rejected the command and the connection is fine."""
+    sqlstate = exc.sqlstate if isinstance(exc, psycopg.Error) else None
+    return (
+        sqlstate is not None
+        and not sqlstate.startswith(("08", "57"))  # connection exception / operator intervention
+        and not conn.closed
+    )
 
 
 def _describe(exc: BaseException) -> str:
@@ -125,7 +152,17 @@ class PsycopgBackend(BroadcastBackend):
             await self._close(publish_conn)
 
     async def subscribe(self, channel: str) -> None:
+        _check_channel(channel)
         self._channels.add(channel)
+        try:
+            await self._subscribe(channel)
+        except BaseException:
+            # Failed or cancelled: Broadcast will not call unsubscribe() for
+            # it, so it must not stay in `_channels` (re-LISTENed forever).
+            self._channels.discard(channel)
+            raise
+
+    async def _subscribe(self, channel: str) -> None:
         async with self._lock:
             conn = self._conn
             if conn is not None:
@@ -133,6 +170,8 @@ class PsycopgBackend(BroadcastBackend):
                     await _with_deadline(conn, self._execute(conn, "LISTEN", channel), self._COMMAND_TIMEOUT)
                     return
                 except Exception as exc:
+                    if _is_server_error(exc, conn):
+                        raise  # e.g. a rejected channel name: not a connection problem
                     logger.warning(
                         "Postgres connection lost while subscribing to %r (%s); reconnecting", channel, _describe(exc)
                     )
@@ -142,7 +181,6 @@ class PsycopgBackend(BroadcastBackend):
         # and stop waiting when the backend is being disconnected.
         await wait_any([self._connected, self._stop], self._SUBSCRIBE_TIMEOUT)
         if self._stop.is_set() or not self._connected.is_set():
-            self._channels.discard(channel)
             if self._stop.is_set():
                 raise ConnectionError(f"Postgres backend is disconnecting: could not subscribe to {channel!r}")
             raise ConnectionError(
@@ -174,7 +212,7 @@ class PsycopgBackend(BroadcastBackend):
                 await _with_deadline(
                     conn, conn.execute("SELECT pg_notify(%s, %s)", (channel, message)), self._COMMAND_TIMEOUT
                 )
-            except BaseException:
+            except Exception:
                 self._publish_conn = None
                 await self._close(conn)
                 raise

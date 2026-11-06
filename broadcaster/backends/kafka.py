@@ -56,7 +56,14 @@ class KafkaBackend(BroadcastBackend):
             new = {TopicPartition(channel, partition) for partition in partition_ids}
             self._partitions[channel] = new
             self._consumer_channels.add(channel)
-            await self._reassign(new)
+            try:
+                await self._reassign(new)
+            except BaseException:
+                # Failed or cancelled: Broadcast will not call unsubscribe()
+                # for it. The next reassignment drops its partitions.
+                self._consumer_channels.discard(channel)
+                self._partitions.pop(channel, None)
+                raise
             self._ready.set()
 
     async def unsubscribe(self, channel: str) -> None:

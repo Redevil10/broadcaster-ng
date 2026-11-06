@@ -356,3 +356,27 @@ async def test_reader_crash_is_logged_and_restarted(
                 await publish_until_received(broadcast, subscriber)
     assert "reader stopped unexpectedly" in caplog.text
     assert "bug in reader" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_cancelled_subscribe_during_outage_leaves_no_channel(proxy: TcpProxy) -> None:
+    # E.g. a websocket handler cancelled while subscribe() waits for Redis.
+    async with Broadcast(proxied_url(proxy)) as broadcast:
+        async with broadcast.subscribe("other"):
+            await proxy.refuse()
+            await proxy.reset()
+            await asyncio.sleep(0.1)
+
+            async def join() -> None:
+                async with broadcast.subscribe("chatroom"):
+                    pass  # pragma: no cover
+
+            task = asyncio.create_task(join())
+            await asyncio.sleep(0.1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            backend = broadcast._backend
+            assert isinstance(backend, RedisBackend)
+            assert "chatroom" not in backend._channels
+            await proxy.accept()

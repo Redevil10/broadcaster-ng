@@ -407,3 +407,39 @@ async def test_disconnect_during_heartbeat_on_half_open_link_is_prompt(proxy: Tc
 )
 def test_split_keepalive_params_leaves_the_rest_of_the_dsn_alone(url: str, expected: str) -> None:
     assert _split_keepalive_params(url)[0] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel", ["", "a\x00b"])
+async def test_invalid_channel_name(channel: str) -> None:
+    async with Broadcast(POSTGRES_URL) as broadcast:
+        with pytest.raises(ValueError, match="invalid Postgres channel name"):
+            async with broadcast.subscribe(channel):
+                pass  # pragma: no cover
+        assert channel not in listener_backend(broadcast)._channels
+
+
+@pytest.mark.asyncio
+async def test_listen_rejected_by_server_does_not_drop_the_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A server error is the caller's problem, not a lost connection: the
+    # LISTEN connection (and every other channel) must be left alone.
+    async with Broadcast(POSTGRES_URL) as broadcast:
+        backend = listener_backend(broadcast)
+        async with broadcast.subscribe("chatroom") as subscriber:
+            conn = backend._conn
+            assert conn is not None
+            original = type(conn).add_listener
+
+            async def add_listener(self: typing.Any, channel: str, callback: typing.Any) -> None:
+                if channel == "bad":
+                    await self.execute("LISTEN")  # syntax error
+                await original(self, channel, callback)
+
+            monkeypatch.setattr(type(conn), "add_listener", add_listener)
+            with pytest.raises(asyncpg.PostgresSyntaxError):
+                async with broadcast.subscribe("bad"):
+                    pass  # pragma: no cover
+            assert backend._conn is conn
+            assert "bad" not in backend._channels
+            await broadcast.publish("chatroom", "still here")
+            assert (await asyncio.wait_for(subscriber.get(), 2)).message == "still here"

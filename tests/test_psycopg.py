@@ -10,6 +10,7 @@ import asyncio
 import logging
 import os
 import time
+import typing
 from collections.abc import AsyncIterator, Iterator
 from urllib.parse import urlsplit, urlunsplit
 
@@ -331,3 +332,62 @@ async def test_notification_arriving_during_another_command_is_kept() -> None:
                 await asyncio.sleep(0.2)  # let the reader leave notifies()
                 await asyncio.gather(conn.execute("SELECT pg_sleep(0.3)"), broadcast.publish("chatroom", "during"))
             assert (await asyncio.wait_for(subscriber.get(), 2)).message == "during"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_subscribe_keeps_the_shared_connection() -> None:
+    # Cancelling one caller's LISTEN (e.g. a websocket handler cancelled by
+    # its task group) used to close the LISTEN connection for every channel.
+    backend = PsycopgBackend(psycopg_url())
+    async with Broadcast(backend=backend) as broadcast:
+        async with broadcast.subscribe("chatroom") as subscriber:
+            conn = backend._conn
+            assert conn is not None
+            busy = asyncio.create_task(conn.execute("SELECT pg_sleep(0.3)"))  # LISTEN queues behind it
+            await asyncio.sleep(0.05)
+
+            async def join() -> None:
+                async with broadcast.subscribe("other"):
+                    pass  # pragma: no cover
+
+            task = asyncio.create_task(join())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await busy
+            assert backend._conn is conn and not conn.closed
+            assert "other" not in backend._channels
+            await broadcast.publish("chatroom", "still here")
+            assert (await asyncio.wait_for(subscriber.get(), 2)).message == "still here"
+
+
+@pytest.mark.asyncio
+async def test_listen_rejected_by_server_does_not_drop_the_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+    original = PsycopgBackend._execute
+
+    async def execute(conn: typing.Any, command: str, channel: str) -> None:
+        if channel == "bad":
+            await conn.execute("LISTEN")  # syntax error
+        await original(conn, command, channel)
+
+    monkeypatch.setattr(PsycopgBackend, "_execute", staticmethod(execute))
+    backend = PsycopgBackend(psycopg_url())
+    async with Broadcast(backend=backend) as broadcast:
+        async with broadcast.subscribe("chatroom") as subscriber:
+            conn = backend._conn
+            with pytest.raises(psycopg.errors.SyntaxError):
+                async with broadcast.subscribe("bad"):
+                    pass  # pragma: no cover
+            assert backend._conn is conn
+            assert "bad" not in backend._channels
+            await broadcast.publish("chatroom", "still here")
+            assert (await asyncio.wait_for(subscriber.get(), 2)).message == "still here"
+
+
+@pytest.mark.asyncio
+async def test_invalid_channel_name() -> None:
+    async with Broadcast(psycopg_url()) as broadcast:
+        with pytest.raises(ValueError, match="invalid Postgres channel name"):
+            async with broadcast.subscribe(""):
+                pass  # pragma: no cover

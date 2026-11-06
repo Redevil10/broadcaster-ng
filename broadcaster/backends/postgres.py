@@ -26,6 +26,23 @@ def _describe(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
+def _check_channel(channel: str) -> None:
+    # Rejected by the server or the driver; caught here so the error is clear.
+    if not channel or "\x00" in channel:
+        raise ValueError(f"invalid Postgres channel name: {channel!r}")
+
+
+def _is_server_error(exc: BaseException, conn: asyncpg.Connection) -> bool:
+    """True if the server rejected the command and the connection is fine."""
+    sqlstate = getattr(exc, "sqlstate", None)
+    return (
+        isinstance(exc, asyncpg.PostgresError)
+        and isinstance(sqlstate, str)
+        and not sqlstate.startswith(("08", "57"))  # connection exception / operator intervention
+        and not conn.is_closed()
+    )
+
+
 def _split_keepalive_params(url: str) -> tuple[str, dict[str, int]]:
     # Edits only the query string and leaves the rest of the DSN exactly as
     # written: a urlsplit/urlunsplit round trip turns postgresql:///db (the
@@ -141,7 +158,17 @@ class PostgresBackend(BroadcastBackend):
                 pool.terminate()
 
     async def subscribe(self, channel: str) -> None:
+        _check_channel(channel)
         self._channels.add(channel)
+        try:
+            await self._subscribe(channel)
+        except BaseException:
+            # Failed or cancelled: Broadcast will not call unsubscribe() for
+            # it, so it must not stay in `_channels` (re-LISTENed forever).
+            self._channels.discard(channel)
+            raise
+
+    async def _subscribe(self, channel: str) -> None:
         async with self._lock:
             conn = self._conn
             if conn is not None:
@@ -149,6 +176,8 @@ class PostgresBackend(BroadcastBackend):
                     await asyncio.wait_for(conn.add_listener(channel, self._listener), self._COMMAND_TIMEOUT)
                     return
                 except Exception as exc:
+                    if _is_server_error(exc, conn):
+                        raise  # e.g. a rejected channel name: not a connection problem
                     logger.warning(
                         "Postgres connection lost while subscribing to %r (%s); reconnecting", channel, _describe(exc)
                     )
@@ -158,7 +187,6 @@ class PostgresBackend(BroadcastBackend):
         # Also stop waiting when the backend is being disconnected.
         await wait_any([self._connected, self._stop], self._SUBSCRIBE_TIMEOUT)
         if self._stop.is_set() or not self._connected.is_set():
-            self._channels.discard(channel)
             if self._stop.is_set():
                 raise ConnectionError(f"Postgres backend is disconnecting: could not subscribe to {channel!r}")
             raise ConnectionError(
