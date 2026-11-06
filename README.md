@@ -11,7 +11,7 @@
 > - Focus: reliable connection-loss handling (reconnect, re-subscribe,
 >   half-open detection) for the Redis pub/sub and Postgres backends. Redis
 >   Streams and Kafka are kept as is.
-> - Status: in development, not yet released.
+> - Status: 0.4.0 is the first release of the fork. See [CHANGELOG.md](CHANGELOG.md).
 
 Broadcaster helps you develop realtime streaming functionality by providing
 a simple broadcast API onto a number of different backend services.
