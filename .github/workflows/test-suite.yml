@@ -82,3 +82,5 @@ jobs:
         run: "scripts/test"
       - name: "Enforce coverage"
         run: "scripts/coverage"
+      - name: "API compatibility: unmodified upstream tests"
+        run: "python -m pytest -p no:cacheprovider tests_upstream"
