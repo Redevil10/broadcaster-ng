@@ -58,6 +58,8 @@ include = [
 
 [tool.ruff]
 line-length = 120
+# Byte-identical copies of upstream test files.
+extend-exclude = ["tests_upstream"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "FA", "UP"]

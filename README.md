@@ -70,12 +70,14 @@ async def chatroom_ws_sender(websocket):
 
 routes = [
     Route("/", homepage),
-    WebSocketRoute("/", chatroom_ws, name='chatroom_ws'),
+    WebSocketRoute("/", chatroom_ws, name="chatroom_ws"),
 ]
 
 
 app = Starlette(
-    routes=routes, on_startup=[broadcast.connect], on_shutdown=[broadcast.disconnect],
+    routes=routes,
+    on_startup=[broadcast.connect],
+    on_shutdown=[broadcast.disconnect],
 )
 ```
 
@@ -127,6 +129,7 @@ backends keep working through connection loss:
       # Messages published during the last `downtime` seconds were lost.
       await reload_state(channels)
 
+
   broadcast = Broadcast("redis://localhost:6379", on_reconnect=on_reconnect)
   ```
 
@@ -168,6 +171,7 @@ and pass it to the `broadcaster` via `backend` argument.
 ```python
 from broadcaster import Broadcast, BroadcastBackend, Event
 
+
 class MyBackend(BroadcastBackend):
     async def connect(self) -> None: ...
     async def disconnect(self) -> None: ...
@@ -175,6 +179,7 @@ class MyBackend(BroadcastBackend):
     async def unsubscribe(self, channel: str) -> None: ...
     async def publish(self, channel: str, message: str) -> None: ...
     async def next_published(self) -> Event: ...
+
 
 broadcast = Broadcast(backend=MyBackend())
 ```
