@@ -36,7 +36,7 @@ dependencies = [
 [project.optional-dependencies]
 redis = ["redis>=5"]
 postgres = ["asyncpg"]
-psycopg = ["psycopg[binary]>=3.2"]
+psycopg = ["psycopg[binary]>=3.2.4"]  # 3.2.4 keeps notifications that arrive outside notifies()
 kafka = ["aiokafka"]
 test =  ["pytest", "pytest-asyncio"]
 

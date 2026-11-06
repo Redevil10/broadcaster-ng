@@ -315,3 +315,19 @@ async def test_reader_crash_is_logged_and_restarted(
 def test_libpq_url(url: str, expected: str) -> None:
     assert _libpq_url(url) == expected
     assert psycopg.conninfo.conninfo_to_dict(_libpq_url(url))["dbname"] == "db"
+
+
+@pytest.mark.asyncio
+async def test_notification_arriving_during_another_command_is_kept() -> None:
+    # The LISTEN connection also runs LISTEN/UNLISTEN and the heartbeat. A
+    # notification that arrives meanwhile must still reach the reader (psycopg
+    # buffers it since 3.2.4; older versions dropped it).
+    backend = PsycopgBackend(psycopg_url())
+    async with Broadcast(backend=backend) as broadcast:
+        async with broadcast.subscribe("chatroom") as subscriber:
+            conn = backend._conn
+            assert conn is not None
+            async with backend._lock:  # keep other commands off the connection
+                await asyncio.sleep(0.2)  # let the reader leave notifies()
+                await asyncio.gather(conn.execute("SELECT pg_sleep(0.3)"), broadcast.publish("chatroom", "during"))
+            assert (await asyncio.wait_for(subscriber.get(), 2)).message == "during"
