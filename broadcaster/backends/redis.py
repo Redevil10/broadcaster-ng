@@ -88,6 +88,9 @@ class RedisBackend(BroadcastBackend):
         self._reader: asyncio.Task[None] | None = None
         self._last_seen = 0.0
         self._last_ping = 0.0
+        # SUBSCRIBE and PING do not wait for the reply; the reader expects one
+        # (or any other data) by this time, else the connection is dead.
+        self._reply_due: float | None = None
         self._down_since: float | None = None
 
     async def connect(self) -> None:
@@ -117,6 +120,7 @@ class RedisBackend(BroadcastBackend):
             if pubsub is not None:
                 try:
                     await asyncio.wait_for(pubsub.subscribe(channel), self._COMMAND_TIMEOUT)
+                    self._expect_reply()
                     return
                 except Exception as exc:
                     # Any failure means this connection is unusable; e.g. right
@@ -159,6 +163,11 @@ class RedisBackend(BroadcastBackend):
     async def next_published(self) -> Event:
         return await self._queue.get()
 
+    def _expect_reply(self) -> None:
+        due = time.monotonic() + self._COMMAND_TIMEOUT
+        if self._reply_due is None or due < self._reply_due:
+            self._reply_due = due
+
     def _forget(self, channel: str) -> None:
         self._channels.discard(channel)
         if not self._channels:
@@ -179,6 +188,9 @@ class RedisBackend(BroadcastBackend):
             raise
         self._pubsub = pubsub
         self._last_seen = self._last_ping = time.monotonic()
+        self._reply_due = None
+        if self._channels:
+            self._expect_reply()
         self._connected.set()
 
     async def _drop(self, pubsub: PubSub) -> None:
@@ -260,14 +272,18 @@ class RedisBackend(BroadcastBackend):
             # Anything counts as a sign of life, including subscribe
             # confirmations and the PONG to our own PING.
             self._last_seen = now
+            self._reply_due = None
             if message["type"] == "message":
                 await self._queue.put(Event(channel=_to_str(message["channel"]), message=_to_str(message["data"])))
             return
+        if self._reply_due is not None and now >= self._reply_due:
+            raise redis_exceptions.ConnectionError(f"no reply from Redis within {self._COMMAND_TIMEOUT:g} s")
         if now - self._last_seen >= self._SILENT_LIMIT:
             raise redis_exceptions.ConnectionError(f"no data from Redis for {self._SILENT_LIMIT:g} s")
         if now - self._last_seen >= self._PING_AFTER and now - self._last_ping >= self._PING_AFTER:
             self._last_ping = now
             await asyncio.wait_for(pubsub.ping(), self._COMMAND_TIMEOUT)
+            self._expect_reply()
 
 
 StreamMessageType = tuple[bytes, tuple[tuple[bytes, dict[bytes, bytes]]]]

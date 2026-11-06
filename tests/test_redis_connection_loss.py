@@ -290,3 +290,24 @@ async def test_disconnect_fails_pending_subscribe_promptly(proxy: TcpProxy) -> N
         with pytest.raises(ConnectionError):
             await asyncio.wait_for(pending, 1)
         assert time.monotonic() - started < 1.5
+
+
+@pytest.mark.asyncio
+async def test_subscribe_on_silently_dead_connection_is_detected_quickly(
+    proxy: TcpProxy, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # SUBSCRIBE does not wait for the server's reply. On a silently dead
+    # connection the missing reply must be noticed within the command deadline
+    # (0.5 s here), not only after the much longer silence limit.
+    monkeypatch.setattr(RedisBackend, "_SILENT_LIMIT", 30.0)
+    monkeypatch.setattr(RedisBackend, "_PING_AFTER", 30.0)
+    with caplog.at_level(logging.WARNING, logger="broadcaster"):
+        async with Broadcast(proxied_url(proxy)) as broadcast:
+            async with broadcast.subscribe("other") as other:
+                await publish_until_received(broadcast, other, "other")
+                proxy.mute()
+                async with broadcast.subscribe("chatroom") as subscriber:
+                    await asyncio.sleep(1.0)
+                    assert "no reply from Redis" in caplog.text
+                    proxy.unmute()
+                    await publish_until_received(broadcast, subscriber)
