@@ -60,6 +60,10 @@ API and the `broadcaster` import name are unchanged.
 
 ### Added
 
+- Postgres backend using psycopg 3, selected with `postgres+psycopg://` or
+  `postgresql+psycopg://` URLs (`pip install "broadcaster-ng[psycopg]"`), with
+  the same reconnect, heartbeat and timeout behaviour as the asyncpg backend.
+  Plain `postgres://` still uses asyncpg.
 - `subscribe(channel, max_queue_size=N)`: bound a subscriber's queue. When
   it is full the oldest message is dropped (logged, and counted in
   `Subscriber.dropped_messages`). The default stays unbounded.

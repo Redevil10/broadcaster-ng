@@ -380,3 +380,18 @@ async def test_reader_crash_is_logged_and_restarted(
                 await publish_until_received(broadcast, subscriber)
     assert "reader stopped unexpectedly" in caplog.text
     assert "bug in reader" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_disconnect_during_heartbeat_on_half_open_link_is_prompt(proxy: TcpProxy) -> None:
+    # A heartbeat query is pending on a link that no longer delivers anything.
+    # Cancelling a query makes the driver send a cancel request and wait for
+    # it; disconnect() must not wait for that.
+    broadcast = Broadcast(proxied_url(proxy))
+    await broadcast.connect()
+    async with broadcast.subscribe("chatroom"):
+        proxy.mute()
+        await asyncio.sleep(HEARTBEAT_AFTER + 0.1)  # the heartbeat is now in flight
+        started = time.monotonic()
+        await asyncio.wait_for(broadcast.disconnect(), 10)
+    assert time.monotonic() - started < 2

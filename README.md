@@ -4,7 +4,7 @@
 > which is archived. Same API, same import name: replace `broadcaster` with
 > `broadcaster-ng` in your requirements and your code keeps working.
 >
-> - Install: `pip install "broadcaster-ng[redis]"` (or `[postgres]`, `[kafka]`).
+> - Install: `pip install "broadcaster-ng[redis]"` (or `[postgres]`, `[psycopg]`, `[kafka]`).
 > - `broadcaster-ng` and the original `broadcaster` both install the `broadcaster`
 >   package, so they **cannot be installed together**. Uninstall `broadcaster`
 >   first, and check that none of your dependencies pulls it back in.
@@ -100,13 +100,15 @@ Python 3.8+
 * `Broadcast("redis://localhost:6379")`
 * `Broadcast("redis-stream://localhost:6379")`
 * `Broadcast("postgres://localhost:5432/broadcaster")`
+* `Broadcast("postgres+psycopg://localhost:5432/broadcaster")` (psycopg 3 instead of asyncpg; install `broadcaster-ng[psycopg]`)
 * `Broadcast("kafka://localhost:9092")`
 
 
 ## Connection loss and delivery semantics
 
-The Redis pub/sub (`redis://`, `rediss://`) and Postgres (`postgres://`)
-backends keep working through connection loss:
+The Redis pub/sub (`redis://`, `rediss://`) and Postgres (`postgres://`, or
+`postgres+psycopg://` for psycopg 3) backends keep working through connection
+loss:
 
 * **Reconnect by default.** When the connection drops (server restart,
   network failure, `CLIENT KILL`, `pg_terminate_backend()`), the backend
@@ -161,7 +163,7 @@ Drops are logged (at most once a minute) and counted in
   `socket_timeout=5` seconds by default. Override them in the URL, for example
   `redis://localhost:6379?socket_timeout=10`. A client passed in with
   `RedisBackend(conn=...)` is used as configured.
-* Postgres URLs accept the libpq keepalive parameters `keepalives`,
+* Postgres URLs (both drivers) accept the libpq keepalive parameters `keepalives`,
   `keepalives_idle`, `keepalives_interval` and `keepalives_count`. TCP keepalive
   is on by default, as in libpq; `keepalives=0` turns it off.
 * The Postgres listener connection is named `broadcaster-listener` in

@@ -36,6 +36,7 @@ dependencies = [
 [project.optional-dependencies]
 redis = ["redis>=5"]
 postgres = ["asyncpg"]
+psycopg = ["psycopg[binary]>=3.2"]
 kafka = ["aiokafka"]
 test =  ["pytest", "pytest-asyncio"]
 

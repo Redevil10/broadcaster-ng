@@ -80,6 +80,11 @@ class Broadcast:
 
             return RedisStreamBackend(url)
 
+        elif parsed_url.scheme in ("postgres+psycopg", "postgresql+psycopg"):
+            from broadcaster.backends.psycopg import PsycopgBackend
+
+            return PsycopgBackend(url)
+
         elif parsed_url.scheme in ("postgres", "postgresql"):
             from broadcaster.backends.postgres import PostgresBackend
 
