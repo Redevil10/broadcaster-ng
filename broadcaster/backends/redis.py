@@ -334,11 +334,13 @@ class RedisStreamBackend(BroadcastBackend):
         self._consumer = self._client(url)
 
     def _client(self, url: str) -> redis.Redis:
-        return redis.Redis.from_url(
+        # Annotated variable: redis-py 5 types from_url() as returning Any.
+        client: redis.Redis = redis.Redis.from_url(
             url,
             socket_connect_timeout=self._DEFAULT_SOCKET_CONNECT_TIMEOUT,
             socket_timeout=self._DEFAULT_SOCKET_TIMEOUT,
         )
+        return client
 
     async def connect(self) -> None:
         pass
