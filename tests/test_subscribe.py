@@ -169,3 +169,80 @@ async def test_unsubscribe_error_on_normal_exit_is_logged_not_raised(caplog: pyt
         assert broadcast._subscribers == {}
         assert broadcast._channel_locks == {}
         assert "Failed to unsubscribe from channel 'chatroom'" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_cancelled_while_cleanup_waits_for_the_lock_still_deregisters() -> None:
+    # The leaving task is cancelled while another task holds the channel lock
+    # (anyio cancels every await in a cancelled task's cleanup). Its queue used
+    # to stay registered, so the backend was never unsubscribed.
+    backend = ControllableBackend()
+    async with Broadcast(backend=backend) as broadcast:
+        joined = asyncio.Event()
+
+        async def member() -> None:
+            async with broadcast.subscribe("chatroom"):
+                joined.set()
+                await asyncio.sleep(60)
+
+        task = asyncio.create_task(member())
+        await joined.wait()
+        async with broadcast._channel_lock("chatroom"):
+            task.cancel()
+            await asyncio.sleep(0.01)
+            task.cancel()  # again, while cleanup waits
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert broadcast._subscribers == {}
+        await asyncio.sleep(0.01)
+        assert backend.calls[-1] == ("unsubscribe", "chatroom")
+        assert broadcast._channel_locks == {}
+
+
+@pytest.mark.asyncio
+async def test_cancelling_the_leaving_task_does_not_interrupt_the_backend_unsubscribe() -> None:
+    backend = ControllableBackend()
+    async with Broadcast(backend=backend) as broadcast:
+        joined = asyncio.Event()
+
+        async def member() -> None:
+            async with broadcast.subscribe("chatroom"):
+                joined.set()
+                await asyncio.sleep(60)
+
+        task = asyncio.create_task(member())
+        await joined.wait()
+        backend.delay = 0.1
+        task.cancel()
+        await asyncio.sleep(0.02)  # now inside the slow backend unsubscribe
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0.2)
+        assert "chatroom" not in backend._subscribed
+
+
+@pytest.mark.asyncio
+async def test_concurrent_first_subscribers_share_one_failed_attempt() -> None:
+    # During an outage each queued caller used to make its own attempt in
+    # turn, so the k-th waited k times the backend's subscribe timeout.
+    backend = ControllableBackend()
+    backend.delay = 0.2
+    backend.subscribe_error = ConnectionError("backend is down")
+    async with Broadcast(backend=backend) as broadcast:
+
+        async def join() -> None:
+            async with broadcast.subscribe("chatroom"):
+                pass  # pragma: no cover
+
+        started = asyncio.get_running_loop().time()
+        results = await asyncio.gather(*(join() for _ in range(5)), return_exceptions=True)
+        assert asyncio.get_running_loop().time() - started < 0.5
+        assert all(isinstance(r, ConnectionError) for r in results)
+        assert backend.calls == [("subscribe", "chatroom")]
+        assert broadcast._channel_locks == {}
+
+        # A later caller tries again.
+        backend.subscribe_error = None
+        async with broadcast.subscribe("chatroom"):
+            pass

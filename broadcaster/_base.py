@@ -66,6 +66,7 @@ class Broadcast:
             self._backend._reconnect_hook = self._handle_reconnect
         self._subscribers: dict[str, set[asyncio.Queue[Event | None]]] = {}
         self._channel_locks: dict[str, _ChannelLock] = {}
+        self._cleanup_tasks: set[asyncio.Task[None]] = set()
         self._listener_task: asyncio.Task[None] | None = None
 
     def _create_backend(self, url: str) -> BroadcastBackend:
@@ -128,6 +129,8 @@ class Broadcast:
                 )
             elif not task.cancelled() and task.exception() is not None:
                 logger.error("Broadcast listener had stopped with an error", exc_info=task.exception())
+        for cleanup_task in list(self._cleanup_tasks):
+            await stop_task(cleanup_task, self._LISTENER_STOP_TIMEOUT)
         await self._backend.disconnect()
         for callback_task in list(self._callback_tasks):
             await stop_task(callback_task, self._LISTENER_STOP_TIMEOUT)
@@ -210,34 +213,60 @@ class Broadcast:
         try:
             yield Subscriber(queue)
         finally:
-            await self._remove_subscriber(channel, queue)
-            # Wake a reader blocked in get(). The queue's storage is unbounded
-            # (the limit applies in offer()), so this never blocks, and it is
-            # not a message: it must not push one out or count as a drop.
-            queue.put_nowait(None)
+            try:
+                await self._remove_subscriber(channel, queue)
+            finally:
+                # Wake a reader blocked in get(). The queue's storage is
+                # unbounded (the limit applies in offer()), so this never
+                # blocks, and it is not a message: it must not push one out or
+                # count as a drop.
+                queue.put_nowait(None)
 
     async def _add_subscriber(self, channel: str, queue: asyncio.Queue[Event | None]) -> None:
         # The lock makes concurrent first subscribers to a channel wait for one
         # backend subscribe instead of each subscribing and overwriting the
         # other's registration.
-        async with self._channel_lock(channel):
+        async with self._channel_lock(channel) as (entry, failures_before):
             subscribers = self._subscribers.get(channel)
             if subscribers is not None:
                 subscribers.add(queue)
                 return
+            if entry.failures != failures_before and entry.error is not None:
+                # The backend subscribe this caller queued behind just failed
+                # (e.g. during an outage, after waiting up to 10 s): share its
+                # error instead of making each waiter wait for its own attempt.
+                raise entry.error
             # Register only after the backend subscribe succeeded.
-            await self._backend.subscribe(channel)
+            try:
+                await self._backend.subscribe(channel)
+            except Exception as exc:
+                entry.failures += 1
+                entry.error = exc
+                raise
             self._subscribers[channel] = {queue}
 
     async def _remove_subscriber(self, channel: str, queue: asyncio.Queue[Event | None]) -> None:
+        # Deregister at once, without awaiting: this runs during cleanup, often
+        # in a task being cancelled (anyio cancels every await in it), and an
+        # abandoned queue must not stay registered.
+        subscribers = self._subscribers.get(channel)
+        if subscribers is None or queue not in subscribers:
+            return
+        subscribers.discard(queue)
+        if subscribers:
+            return
+        del self._subscribers[channel]
+        # The backend unsubscribe runs in its own task, so cancelling the
+        # caller cannot interrupt it halfway.
+        task = asyncio.ensure_future(self._unsubscribe_backend(channel))
+        self._cleanup_tasks.add(task)
+        task.add_done_callback(self._cleanup_tasks.discard)
+        await asyncio.shield(task)
+
+    async def _unsubscribe_backend(self, channel: str) -> None:
         async with self._channel_lock(channel):
-            subscribers = self._subscribers.get(channel)
-            if subscribers is None or queue not in subscribers:
-                return
-            subscribers.discard(queue)
-            if subscribers:
-                return
-            del self._subscribers[channel]
+            if channel in self._subscribers:
+                return  # a new subscriber arrived meanwhile and still needs it
             try:
                 await self._backend.unsubscribe(channel)
             except Exception:
@@ -248,14 +277,17 @@ class Broadcast:
                 logger.warning("Failed to unsubscribe from channel %r", channel, exc_info=True)
 
     @asynccontextmanager
-    async def _channel_lock(self, channel: str) -> AsyncIterator[None]:
+    async def _channel_lock(self, channel: str) -> AsyncIterator[tuple[_ChannelLock, int]]:
+        """Hold the channel's lock; yields the entry and its failure count from
+        before waiting for the lock."""
         entry = self._channel_locks.get(channel)
         if entry is None:
             entry = self._channel_locks[channel] = _ChannelLock()
         entry.users += 1
+        failures_before = entry.failures
         try:
             async with entry.lock:
-                yield
+                yield entry, failures_before
         finally:
             entry.users -= 1
             if entry.users == 0:
@@ -267,6 +299,10 @@ class _ChannelLock:
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
         self.users = 0
+        # Failed backend subscribes, and the last error: shared with callers
+        # that were already waiting for the lock when it failed.
+        self.failures = 0
+        self.error: BaseException | None = None
 
 
 def _offer(queue: asyncio.Queue[Event | None], item: Event | None) -> None:
