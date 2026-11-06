@@ -460,10 +460,9 @@ async def test_subscribe_reply_read_before_the_call_returns_is_not_awaited_again
     monkeypatch.setattr(RedisBackend, "_PING_AFTER", 30.0)
     original = PubSub.subscribe
 
-    async def slow_to_return(self: PubSub, *args: typing.Any, **kwargs: typing.Any) -> typing.Any:
-        result = await original(self, *args, **kwargs)
+    async def slow_to_return(self: PubSub, *args: typing.Any, **kwargs: typing.Any) -> None:
+        await original(self, *args, **kwargs)
         await asyncio.sleep(0.2)  # the reader reads the reply meanwhile
-        return result
 
     with caplog.at_level(logging.WARNING, logger="broadcaster"):
         async with Broadcast("redis://localhost:6379") as broadcast:
