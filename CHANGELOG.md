@@ -29,6 +29,13 @@ API and the `broadcaster` import name are unchanged.
   query; concurrent subscribes no longer fail with "another operation is in
   progress" (encode/broadcaster#22); publishing uses a separate connection
   pool.
+- Kafka: unsubscribing one channel no longer unsubscribes every channel
+  (encode/broadcaster#65), and changing subscriptions no longer loses
+  messages on the other channels.
+- Kafka: subscribing to a topic that does not exist yet took up to 5
+  minutes (until the consumer's next metadata refresh); now it is immediate,
+  and it fails after 10 seconds with `ConnectionError` if the topic never
+  appears instead of waiting forever.
 - `disconnect()` stops the listener reliably, even when a client library
   swallows the cancellation (redis-py 8 on Python 3.11).
 

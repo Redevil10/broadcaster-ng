@@ -159,8 +159,9 @@ logger (`broadcaster.redis`, `broadcaster.postgres` for the backends): a
 WARNING when a connection is lost and when it is restored, and an ERROR when
 reconnecting fails (repeated failures are logged at most once a minute).
 
-The Redis Streams and Kafka backends are kept as they were upstream, apart from
-a fix for Redis Streams after the last unsubscribe.
+The Redis Streams and Kafka backends do not have their own reconnect logic.
+Errors they raise are logged and retried by `Broadcast`; the Kafka client also
+reconnects by itself.
 
 ### Using custom backends
 
