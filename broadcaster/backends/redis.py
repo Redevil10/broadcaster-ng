@@ -35,8 +35,13 @@ class RedisBackend(BroadcastBackend):
             self._listener.cancel()
 
     async def subscribe(self, channel: str) -> None:
-        self._ready.set()
         await self._pubsub.subscribe(channel)
+        # Wake the listener only after redis-py has registered the channel:
+        # `PubSub.listen()` returns at once while `pubsub.subscribed` is False,
+        # and redis-py adds the channel only after sending SUBSCRIBE. Setting
+        # the event first let the listener exit and wait forever whenever the
+        # subscribe call yielded (seen with redis-py 8 on Python 3.10/3.11).
+        self._ready.set()
 
     async def unsubscribe(self, channel: str) -> None:
         await self._pubsub.unsubscribe(channel)

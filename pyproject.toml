@@ -37,7 +37,8 @@ kafka = ["aiokafka"]
 test =  ["pytest", "pytest-asyncio"]
 
 [project.urls]
-# TODO: add Homepage / Repository once the GitHub repo exists.
+Homepage = "https://github.com/Redevil10/broadcaster-ng"
+Issues = "https://github.com/Redevil10/broadcaster-ng/issues"
 Upstream = "https://github.com/encode/broadcaster"
 
 [tool.hatch.version]
