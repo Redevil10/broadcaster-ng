@@ -311,3 +311,22 @@ async def test_subscribe_on_silently_dead_connection_is_detected_quickly(
                     assert "no reply from Redis" in caplog.text
                     proxy.unmute()
                     await publish_until_received(broadcast, subscriber)
+
+
+@pytest.mark.asyncio
+async def test_leaving_subscription_on_dead_connection(proxy: TcpProxy, caplog: pytest.LogCaptureFixture) -> None:
+    # UNSUBSCRIBE does not wait for the reply, so leaving is immediate even on a
+    # dead connection; the missing reply then reveals the dead connection and
+    # the remaining subscriber recovers after the reconnect.
+    with caplog.at_level(logging.WARNING, logger="broadcaster"):
+        async with Broadcast(proxied_url(proxy)) as broadcast:
+            async with broadcast.subscribe("other") as other:
+                await publish_until_received(broadcast, other, "other")
+                async with broadcast.subscribe("chatroom"):
+                    proxy.mute()
+                    started = time.monotonic()
+                assert time.monotonic() - started < 0.5
+                await asyncio.sleep(1.0)
+                assert "no reply from Redis" in caplog.text
+                proxy.unmute()
+                await publish_until_received(broadcast, other, "other")

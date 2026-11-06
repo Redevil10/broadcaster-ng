@@ -88,7 +88,7 @@ class RedisBackend(BroadcastBackend):
         self._reader: asyncio.Task[None] | None = None
         self._last_seen = 0.0
         self._last_ping = 0.0
-        # SUBSCRIBE and PING do not wait for the reply; the reader expects one
+        # SUBSCRIBE, UNSUBSCRIBE and PING do not wait for the reply; the reader expects one
         # (or any other data) by this time, else the connection is dead.
         self._reply_due: float | None = None
         self._down_since: float | None = None
@@ -151,6 +151,7 @@ class RedisBackend(BroadcastBackend):
                 return  # nothing to do: a reconnect will not re-subscribe it
             try:
                 await asyncio.wait_for(pubsub.unsubscribe(channel), self._COMMAND_TIMEOUT)
+                self._expect_reply()
             except Exception as exc:  # see subscribe()
                 logger.warning(
                     "Redis connection lost while unsubscribing from %r (%s); reconnecting", channel, _describe(exc)

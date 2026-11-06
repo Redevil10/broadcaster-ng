@@ -337,3 +337,20 @@ async def test_disconnect_fails_pending_subscribe_promptly(proxy: TcpProxy) -> N
         with pytest.raises(ConnectionError):
             await asyncio.wait_for(pending, 1)
         assert time.monotonic() - started < 1.5
+
+
+@pytest.mark.asyncio
+async def test_leaving_subscription_on_dead_connection(proxy: TcpProxy, caplog: pytest.LogCaptureFixture) -> None:
+    # UNSUBSCRIBE on a dead connection times out: leaving must not raise or hang,
+    # and other subscribers recover after the reconnect.
+    with caplog.at_level(logging.WARNING, logger="broadcaster"):
+        async with Broadcast(proxied_url(proxy)) as broadcast:
+            async with broadcast.subscribe("other") as other:
+                await publish_until_received(broadcast, other, "other")
+                async with broadcast.subscribe("chatroom"):
+                    proxy.mute()
+                    started = time.monotonic()
+                assert time.monotonic() - started < 2.0
+                assert "while unsubscribing from 'chatroom'" in caplog.text
+                proxy.unmute()
+                await publish_until_received(broadcast, other, "other")
