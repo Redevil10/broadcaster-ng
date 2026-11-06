@@ -9,7 +9,7 @@ from redis import asyncio as redis, exceptions as redis_exceptions
 from redis.asyncio.client import PubSub
 
 from .._base import Event
-from .._utils import stop_task, wait_or_stop
+from .._utils import stop_task, wait_any, wait_or_stop
 from .base import BroadcastBackend
 
 logger = logging.getLogger("broadcaster.redis")
@@ -129,13 +129,15 @@ class RedisBackend(BroadcastBackend):
         # No live connection: the reader re-subscribes every channel in
         # `_channels` (including this one) when it reconnects. Wait for that,
         # within a bound, so callers do not hang through a long outage.
-        try:
-            await asyncio.wait_for(self._connected.wait(), self._SUBSCRIBE_TIMEOUT)
-        except asyncio.TimeoutError:
+        # Also stop waiting when the backend is being disconnected.
+        await wait_any([self._connected, self._stop], self._SUBSCRIBE_TIMEOUT)
+        if self._stop.is_set() or not self._connected.is_set():
             self._forget(channel)
+            if self._stop.is_set():
+                raise ConnectionError(f"Redis backend is disconnecting: could not subscribe to {channel!r}")
             raise ConnectionError(
                 f"Redis is unavailable: could not subscribe to {channel!r} within {self._SUBSCRIBE_TIMEOUT:g} s"
-            ) from None
+            )
 
     async def unsubscribe(self, channel: str) -> None:
         self._forget(channel)

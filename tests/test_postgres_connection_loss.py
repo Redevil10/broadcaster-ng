@@ -298,3 +298,42 @@ def test_split_keepalive_params_keeps_other_params() -> None:
     )
     assert url == "postgres://u:p@h:5432/db?sslmode=disable&application_name=x"
     assert options == {"keepalives_idle": 7}
+
+
+@pytest.mark.asyncio
+async def test_disconnect_while_reconnecting_to_unresponsive_server_is_prompt(proxy: TcpProxy) -> None:
+    # Fix #9a: the reader is stuck in a connect handshake that never completes.
+    broadcast = Broadcast(proxied_url(proxy))
+    await broadcast.connect()
+    async with broadcast.subscribe("chatroom"):
+        proxy.mute()
+        await proxy.reset()
+        await asyncio.sleep(0.1)  # reader is now reconnecting into the muted proxy
+        started = time.monotonic()
+        await asyncio.wait_for(broadcast.disconnect(), 3)
+        assert time.monotonic() - started < 1.0
+
+
+@pytest.mark.asyncio
+async def test_disconnect_fails_pending_subscribe_promptly(proxy: TcpProxy) -> None:
+    # Fix #9a: a subscribe() waiting for the reconnect must not wait out its
+    # full timeout once the backend is disconnecting.
+    broadcast = Broadcast(proxied_url(proxy))
+    await broadcast.connect()
+    async with broadcast.subscribe("other"):
+        await proxy.refuse()
+        await proxy.reset()
+        await asyncio.sleep(0.1)
+
+        async def subscribe() -> None:
+            async with broadcast.subscribe("chatroom"):
+                pass  # pragma: no cover
+
+        pending = asyncio.create_task(subscribe())
+        await asyncio.sleep(0.2)
+        assert not pending.done()
+        started = time.monotonic()
+        await asyncio.wait_for(broadcast._backend.disconnect(), 3)
+        with pytest.raises(ConnectionError):
+            await asyncio.wait_for(pending, 1)
+        assert time.monotonic() - started < 1.5

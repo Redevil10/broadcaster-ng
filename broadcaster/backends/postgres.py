@@ -10,7 +10,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import asyncpg
 
 from .._base import Event
-from .._utils import stop_task, wait_or_stop
+from .._utils import stop_task, wait_any, wait_or_stop
 from .base import BroadcastBackend
 
 logger = logging.getLogger("broadcaster.postgres")
@@ -145,13 +145,15 @@ class PostgresBackend(BroadcastBackend):
                     self._drop(conn)
         # No live connection: the reader LISTENs every channel in `_channels`
         # (including this one) when it reconnects. Wait for that, within a bound.
-        try:
-            await asyncio.wait_for(self._connected.wait(), self._SUBSCRIBE_TIMEOUT)
-        except asyncio.TimeoutError:
+        # Also stop waiting when the backend is being disconnected.
+        await wait_any([self._connected, self._stop], self._SUBSCRIBE_TIMEOUT)
+        if self._stop.is_set() or not self._connected.is_set():
             self._channels.discard(channel)
+            if self._stop.is_set():
+                raise ConnectionError(f"Postgres backend is disconnecting: could not subscribe to {channel!r}")
             raise ConnectionError(
                 f"Postgres is unavailable: could not subscribe to {channel!r} within {self._SUBSCRIBE_TIMEOUT:g} s"
-            ) from None
+            )
 
     async def unsubscribe(self, channel: str) -> None:
         self._channels.discard(channel)

@@ -32,3 +32,17 @@ async def wait_or_stop(stop: asyncio.Event, delay: float) -> None:
         await asyncio.wait_for(stop.wait(), timeout=delay)
     except asyncio.TimeoutError:
         pass
+
+
+async def wait_any(events: list[asyncio.Event], timeout: float) -> bool:
+    """Wait until any of `events` is set, for at most `timeout` seconds.
+
+    Returns True if one was set.
+    """
+    waiters = [asyncio.ensure_future(event.wait()) for event in events]
+    try:
+        done, _ = await asyncio.wait(waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+        return bool(done)
+    finally:
+        for waiter in waiters:
+            waiter.cancel()
