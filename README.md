@@ -101,6 +101,50 @@ Python 3.8+
 * `Broadcast("kafka://localhost:9092")`
 
 
+## Connection loss and delivery semantics
+
+The Redis pub/sub (`redis://`, `rediss://`) and Postgres (`postgres://`)
+backends keep working through connection loss:
+
+* **Reconnect by default.** When the connection drops (server restart,
+  network failure, `CLIENT KILL`, `pg_terminate_backend()`), the backend
+  reconnects with capped backoff and re-subscribes every channel that still
+  has subscribers. Existing subscribers keep receiving messages afterwards; you
+  do not need to re-subscribe.
+* **Half-open connections are detected.** If the connection stays open but
+  nothing gets through, an idle-time `PING` (Redis) or `SELECT 1` heartbeat
+  (Postgres) notices and triggers a reconnect.
+* **Delivery is at-most-once.** Redis pub/sub and Postgres `NOTIFY` do not
+  store messages, so anything published while a backend is reconnecting is
+  lost. Every reconnect is logged with how long the connection was down. If your
+  application cannot tolerate gaps, reload state from your source of truth
+  after a reconnect.
+* **`subscribe()` during an outage** waits for the reconnect for up to 10
+  seconds, then raises `ConnectionError`. `connect()` still fails immediately if
+  the server cannot be reached at startup.
+
+### Timeouts and keepalive
+
+* Redis clients created from a URL use `socket_connect_timeout=5` and
+  `socket_timeout=5` seconds by default. Override them in the URL, for example
+  `redis://localhost:6379?socket_timeout=10`. A client passed in with
+  `RedisBackend(conn=...)` is used as configured.
+* Postgres URLs accept the libpq keepalive parameters `keepalives`,
+  `keepalives_idle`, `keepalives_interval` and `keepalives_count`. TCP keepalive
+  is on by default, as in libpq; `keepalives=0` turns it off.
+* The Postgres listener connection is named `broadcaster-listener` in
+  `pg_stat_activity`. Publishing uses a separate small connection pool.
+
+### Logging
+
+Connection problems are logged, never silently ignored, on the `broadcaster`
+logger (`broadcaster.redis`, `broadcaster.postgres` for the backends): a
+WARNING when a connection is lost and when it is restored, and an ERROR when
+reconnecting fails (repeated failures are logged at most once a minute).
+
+The Redis Streams and Kafka backends are kept as they were upstream, apart from
+a fix for Redis Streams after the last unsubscribe.
+
 ### Using custom backends
 
 You can create your own backend and use it with `broadcaster`.
@@ -108,26 +152,31 @@ To do that you need to create a class which extends from `BroadcastBackend`
 and pass it to the `broadcaster` via `backend` argument.
 
 ```python
-from broadcaster import Broadcaster, BroadcastBackend
+from broadcaster import Broadcast, BroadcastBackend, Event
 
 class MyBackend(BroadcastBackend):
+    async def connect(self) -> None: ...
+    async def disconnect(self) -> None: ...
+    async def subscribe(self, channel: str) -> None: ...
+    async def unsubscribe(self, channel: str) -> None: ...
+    async def publish(self, channel: str, message: str) -> None: ...
+    async def next_published(self) -> Event: ...
 
-broadcaster = Broadcaster(backend=MyBackend())
+broadcast = Broadcast(backend=MyBackend())
 ```
+
+If `next_published()` raises, `Broadcast` logs the error, backs off and calls it
+again, so a backend can recover by itself instead of stopping delivery.
 
 ## Where next?
 
-At the moment `broadcaster` is in Alpha, and should be considered a working design document.
+This fork focuses on reliability and compatibility. The public API is the same
+as encode/broadcaster 0.3.x. See [CHANGELOG.md](CHANGELOG.md) for what changed.
 
-The API should be considered subject to change. If you *do* want to use Broadcaster in its current
-state, make sure to strictly pin your requirements to `broadcaster==0.3.0`.
-
-To be more capable we'd really want to add some additional backends, provide API support for reading recent event history from persistent stores, and provide a serialization/deserialization API...
-
-* Serialization / deserialization to support broadcasting structured data.
-* A backend for RabbitMQ.
-* Add support for `subscribe('chatroom', history=100)` for backends which provide persistence. (Redis Streams, Apache Kafka) This will allow applications to subscribe to channel updates, while also being given an initial window onto the most recent events. We *might* also want to support some basic paging operations, to allow applications to scan back in the event history.
-* Support for pattern subscribes in backends that support it.
+Ideas from the upstream roadmap that are not planned yet: serialization of
+structured data, a RabbitMQ backend, reading recent history
+(`subscribe('chatroom', history=100)`) for backends with persistence, and
+pattern subscribes.
 
 ## Third Party Packages
 
