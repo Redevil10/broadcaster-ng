@@ -62,6 +62,10 @@ jobs:
         with:
           python-version: "${{ matrix.python-version }}"
           allow-prereleases: true
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+            pyproject.toml
       - name: "Install dependencies"
         run: "scripts/install"
       - name: "Pin redis-py major"
