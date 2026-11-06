@@ -3,12 +3,12 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "broadcaster"
+name = "broadcaster-ng"
 dynamic = ["version"]
-description = "Simple broadcast channels."
+description = "Simple broadcast channels. Maintained fork of encode/broadcaster with connection-loss fixes."
 readme = "README.md"
 license = "BSD-3-Clause"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 authors = [
     { name = "Tom Christie", email = "tom@tomchristie.com" },
 ]
@@ -20,28 +20,32 @@ classifiers = [
     "Operating System :: OS Independent",
     "Topic :: Internet :: WWW/HTTP",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
     "anyio>=3.4.0,<5",
-    "typing_extensions>=3.10.0; python_version < '3.10'",
 ]
 
 [project.optional-dependencies]
-redis = ["redis"]
+redis = ["redis>=5"]
 postgres = ["asyncpg"]
 kafka = ["aiokafka"]
 test =  ["pytest", "pytest-asyncio"]
 
 [project.urls]
-Homepage = "https://github.com/encode/broadcaster"
+# TODO: add Homepage / Repository once the GitHub repo exists.
+Upstream = "https://github.com/encode/broadcaster"
 
 [tool.hatch.version]
 path = "broadcaster/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+# PyPI name is broadcaster-ng, import name stays `broadcaster`.
+packages = ["broadcaster"]
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -59,7 +63,7 @@ combine-as-imports = true
 
 [tool.mypy]
 strict = true
-python_version = "3.8"
+python_version = "3.10"
 disallow_untyped_defs = true
 ignore_missing_imports = true
 
@@ -70,6 +74,7 @@ check_untyped_defs = true
 
 [tool.pytest.ini_options]
 addopts = "-rxXs"
+asyncio_default_fixture_loop_scope = "function"
 markers = "copied_from(source, changes=None): mark test as copied from somewhere else, along with a description of changes made to accodomate e.g. our test setup"
 
 [tool.coverage.run]

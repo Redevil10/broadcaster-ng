@@ -9,6 +9,6 @@ fi
 if [ -d 'htmlcov' ] ; then
     rm -r htmlcov
 fi
-if [ -d 'broadcaster.egg-info' ] ; then
-    rm -r broadcaster.egg-info
+if [ -d 'broadcaster_ng.egg-info' ] ; then
+    rm -r broadcaster_ng.egg-info
 fi

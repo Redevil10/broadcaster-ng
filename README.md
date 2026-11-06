@@ -1,4 +1,17 @@
-# Broadcaster
+# Broadcaster (broadcaster-ng)
+
+> **Maintained fork of [encode/broadcaster](https://github.com/encode/broadcaster)**,
+> which is archived. Same API, same import name: replace `broadcaster` with
+> `broadcaster-ng` in your requirements and your code keeps working.
+>
+> - Install: `pip install "broadcaster-ng[redis]"` (or `[postgres]`, `[kafka]`).
+> - `broadcaster-ng` and the original `broadcaster` both install the `broadcaster`
+>   package, so they **cannot be installed together**. Uninstall `broadcaster`
+>   first, and check that none of your dependencies pulls it back in.
+> - Focus: reliable connection-loss handling (reconnect, re-subscribe,
+>   half-open detection) for the Redis pub/sub and Postgres backends. Redis
+>   Streams and Kafka are kept as is.
+> - Status: in development, not yet released.
 
 Broadcaster helps you develop realtime streaming functionality by providing
 a simple broadcast API onto a number of different backend services.
