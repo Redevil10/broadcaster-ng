@@ -85,9 +85,16 @@ asyncio_default_fixture_loop_scope = "function"
 markers = "copied_from(source, changes=None): mark test as copied from somewhere else, along with a description of changes made to accodomate e.g. our test setup"
 
 [tool.coverage.run]
-source_pkgs = ["broadcaster", "tests"]
+# Measure the library only (test files are near 100% by definition), with
+# branch coverage.
+source_pkgs = ["broadcaster"]
+branch = true
 
 [tool.coverage.report]
-fail_under = 78
+fail_under = 90
+exclude_also = [
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
 show_missing = true
 skip_covered = true
