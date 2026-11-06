@@ -10,3 +10,6 @@ dist/
 
 # Private design notes and work logs
 notes/
+
+# IDE
+.idea/
