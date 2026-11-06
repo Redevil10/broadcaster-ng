@@ -114,7 +114,9 @@ loss:
   network failure, `CLIENT KILL`, `pg_terminate_backend()`), the backend
   reconnects with capped backoff and re-subscribes every channel that still
   has subscribers. Existing subscribers keep receiving messages afterwards; you
-  do not need to re-subscribe.
+  do not need to re-subscribe. `subscribe()` returns once the server has
+  confirmed the subscription, so messages published after it returns are
+  delivered.
 * **Half-open connections are detected.** If the connection stays open but
   nothing gets through, an idle-time `PING` (Redis) or `SELECT 1` heartbeat
   (Postgres) notices and triggers a reconnect.
@@ -182,7 +184,9 @@ The Redis Streams (`redis-stream://`) and Kafka backends recover from
 connection loss too: errors are logged and retried, and the clients reconnect.
 Both store messages, so nothing published during the outage is lost: Redis
 Streams continues from the last message ID it read. Redis Streams clients get
-the same default socket timeouts as Redis pub/sub.
+the same default socket timeouts as Redis pub/sub. The Kafka backend checks
+subscribed topics for added partitions every minute and reads new partitions
+from their beginning.
 
 ### Using custom backends
 

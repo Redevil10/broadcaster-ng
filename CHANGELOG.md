@@ -43,6 +43,24 @@ API and the `broadcaster` import name are unchanged.
   minutes (until the consumer's next metadata refresh); now it is immediate,
   and it fails after 10 seconds with `ConnectionError` if the topic never
   appears instead of waiting forever.
+- Kafka: a slow or missing topic no longer holds up subscription changes on
+  other channels; the whole `subscribe()` is bounded by the 10 s timeout and
+  a failed one restores the consumer's previous assignment. Partitions added
+  to a subscribed topic are picked up within a minute.
+- Leaving a subscription completes even when the task is cancelled during
+  cleanup (anyio/Starlette cancel every await in it): the queue is
+  deregistered and the backend unsubscribed. A cancelled subscribe is undone
+  on the server.
+- Concurrent first subscribers to a channel during an outage share one
+  failed attempt instead of each waiting for its own.
+- Redis pub/sub: `subscribe()` and reconnects wait for Redis to confirm
+  `SUBSCRIBE`, so `on_reconnect` and messages published after `subscribe()`
+  returns cannot race ahead of the subscription; no needless reconnect when
+  the confirmation is read early.
+- A server that accepts connections and drops them at once no longer causes a
+  tight reconnect loop: such drops count as failed attempts, with backoff.
+- Postgres: `keepalives_idle=0` (and the other keepalive settings) means the
+  system default, as in libpq, instead of failing on Linux.
 - `disconnect()` stops the listener reliably, even when a client library
   swallows the cancellation (redis-py 8 on Python 3.11).
 
