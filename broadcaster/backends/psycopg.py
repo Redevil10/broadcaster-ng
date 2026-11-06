@@ -112,6 +112,9 @@ class PsycopgBackend(BroadcastBackend):
     _RECONNECT_BACKOFF_MAX = 5.0
     _LOG_INTERVAL = 60.0
     _STOP_TIMEOUT = 5.0
+    # A connection lost sooner than this after opening counts as a failed
+    # attempt, so a server that accepts and then drops connections gets backoff.
+    _STABLE_AFTER = 10.0
     _READER_RESTART_DELAY = 1.0
     _APPLICATION_NAME = "broadcaster-listener"
 
@@ -304,12 +307,26 @@ class PsycopgBackend(BroadcastBackend):
         )
         asyncio.get_running_loop().call_later(self._READER_RESTART_DELAY, self._start_reader)
 
+    def _backoff(self, failures: int) -> float:
+        return min(self._RECONNECT_BACKOFF_INITIAL * 2.0 ** min(failures - 1, 16), self._RECONNECT_BACKOFF_MAX)
+
     async def _run(self) -> None:
-        failures = 0
+        failures = 0  # for the backoff; includes connections lost right after opening
+        attempts = 0  # failed reconnect attempts since the last successful one, for the log
         last_logged = 0.0
+        connected_at: float | None = time.monotonic()  # the connection opened by connect()
         while not self._stop.is_set():
             conn = self._conn
             if conn is None:
+                if connected_at is not None:
+                    # The connection was just lost.
+                    lived = time.monotonic() - connected_at
+                    connected_at = None
+                    if lived < self._STABLE_AFTER:
+                        failures += 1
+                        await wait_or_stop(self._stop, self._backoff(failures))
+                        continue
+                    failures = 0
                 try:
                     async with self._lock:
                         if self._conn is None:
@@ -318,16 +335,14 @@ class PsycopgBackend(BroadcastBackend):
                     if self._stop.is_set():
                         return
                     failures += 1
+                    attempts += 1
                     now = time.monotonic()
-                    if failures == 1 or now - last_logged >= self._LOG_INTERVAL:
+                    if attempts == 1 or now - last_logged >= self._LOG_INTERVAL:
                         logger.error(
-                            "Could not reconnect to Postgres (attempt %d): %s; retrying", failures, _describe(exc)
+                            "Could not reconnect to Postgres (attempt %d): %s; retrying", attempts, _describe(exc)
                         )
                         last_logged = now
-                    delay = min(
-                        self._RECONNECT_BACKOFF_INITIAL * 2 ** min(failures - 1, 16), self._RECONNECT_BACKOFF_MAX
-                    )
-                    await wait_or_stop(self._stop, delay)
+                    await wait_or_stop(self._stop, self._backoff(failures))
                     continue
                 if self._down_since is not None:
                     downtime = time.monotonic() - self._down_since
@@ -336,7 +351,8 @@ class PsycopgBackend(BroadcastBackend):
                     )
                     self._down_since = None
                     self._notify_reconnect(sorted(self._channels), downtime)
-                failures = 0
+                attempts = 0
+                connected_at = time.monotonic()
                 continue
 
             try:

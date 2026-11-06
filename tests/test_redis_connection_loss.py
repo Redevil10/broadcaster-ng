@@ -380,3 +380,29 @@ async def test_cancelled_subscribe_during_outage_leaves_no_channel(proxy: TcpPro
             assert isinstance(backend, RedisBackend)
             assert "chatroom" not in backend._channels
             await proxy.accept()
+
+
+@pytest.mark.asyncio
+async def test_connection_lost_right_after_opening_backs_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    # E.g. a load balancer that accepts connections and drops them at once.
+    # Each open succeeded, so the retry counter was reset and the reader
+    # reconnected in a tight loop.
+    opens = 0
+    original_open = RedisBackend._open
+
+    async def counting_open(self: RedisBackend) -> None:
+        nonlocal opens
+        opens += 1
+        await original_open(self)
+
+    async def failing_read(self: RedisBackend, pubsub: typing.Any) -> None:
+        raise redis.ConnectionError("dropped")
+
+    monkeypatch.setattr(RedisBackend, "_open", counting_open)
+    async with Broadcast("redis://localhost:6379") as broadcast:
+        async with broadcast.subscribe("chatroom"):
+            monkeypatch.setattr(RedisBackend, "_read_once", failing_read)
+            opens = 0
+            await asyncio.sleep(1.0)
+    # Backoff 0.05 s doubling to 0.2 s: about 6 attempts, not hundreds.
+    assert 1 <= opens <= 10

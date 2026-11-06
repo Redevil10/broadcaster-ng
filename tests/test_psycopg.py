@@ -403,3 +403,30 @@ async def test_application_name_and_connect_timeout_in_url_are_kept() -> None:
         async with backend._lock:
             cur = await conn.execute("SHOW application_name")
             assert await cur.fetchone() == ("myapp",)
+
+
+@pytest.mark.asyncio
+async def test_connection_lost_right_after_opening_backs_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    # E.g. a load balancer that accepts connections and drops them at once:
+    # without backoff the reader reconnected in a tight loop.
+    opens = 0
+    original_open = PsycopgBackend._open
+
+    async def counting_open(self: PsycopgBackend) -> None:
+        nonlocal opens
+        opens += 1
+        await original_open(self)
+
+    async def failing_heartbeat(self: PsycopgBackend, conn: typing.Any) -> None:
+        async with self._lock:
+            await self._drop(conn)
+
+    monkeypatch.setattr(PsycopgBackend, "_open", counting_open)
+    async with Broadcast(psycopg_url()) as broadcast:
+        async with broadcast.subscribe("chatroom"):
+            monkeypatch.setattr(PsycopgBackend, "_HEARTBEAT_AFTER", 0.0)
+            monkeypatch.setattr(PsycopgBackend, "_heartbeat", failing_heartbeat)
+            opens = 0
+            await asyncio.sleep(1.0)
+    # Backoff 0.05 s doubling to 0.2 s: about 6 attempts, not hundreds.
+    assert 1 <= opens <= 10
