@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, cast
@@ -30,11 +31,21 @@ class Unsubscribed(Exception):
 
 
 class Broadcast:
+    # Listener retry policy when the backend raises: capped exponential backoff,
+    # and an ERROR log on the first failure, then at most once per interval.
+    _LISTENER_BACKOFF_INITIAL = 0.1
+    _LISTENER_BACKOFF_MAX = 5.0
+    _LISTENER_LOG_INTERVAL = 60.0
+    # How long disconnect() waits for the listener to stop before closing the
+    # backend anyway.
+    _LISTENER_STOP_TIMEOUT = 5.0
+
     def __init__(self, url: str | None = None, *, backend: BroadcastBackend | None = None) -> None:
         assert url or backend, "Either `url` or `backend` must be provided."
         self._backend = backend or self._create_backend(cast(str, url))
         self._subscribers: dict[str, set[asyncio.Queue[Event | None]]] = {}
         self._channel_locks: dict[str, _ChannelLock] = {}
+        self._listener_task: asyncio.Task[None] | None = None
 
     def _create_backend(self, url: str) -> BroadcastBackend:
         parsed_url = urlparse(url)
@@ -73,18 +84,77 @@ class Broadcast:
 
     async def connect(self) -> None:
         await self._backend.connect()
-        self._listener_task = asyncio.create_task(self._listener())
+        self._listener_stop = asyncio.Event()
+        self._listener_task = asyncio.create_task(self._listener(self._listener_stop))
 
     async def disconnect(self) -> None:
-        if self._listener_task.done():
-            self._listener_task.result()
-        else:
-            self._listener_task.cancel()
+        task, self._listener_task = self._listener_task, None
+        if task is not None:
+            # Both signals: some backend clients swallow a cancellation that
+            # arrives mid-read (seen with redis-py 8 on Python 3.11), so the
+            # listener also checks the stop event after every backend call.
+            self._listener_stop.set()
+            done = await self._stop_listener(task)
+            if not done:
+                logger.warning(
+                    "Broadcast listener did not stop within %g s; disconnecting the backend anyway",
+                    self._LISTENER_STOP_TIMEOUT,
+                )
+            elif not task.cancelled() and task.exception() is not None:
+                logger.error("Broadcast listener had stopped with an error", exc_info=task.exception())
         await self._backend.disconnect()
 
-    async def _listener(self) -> None:
+    async def _stop_listener(self, task: asyncio.Task[None]) -> bool:
+        # Cancel repeatedly until the task finishes or the timeout passes: a
+        # cancellation swallowed by a client library (redis-py 8 on Python 3.11
+        # turns one arriving inside a blocking XREAD into an empty result) is
+        # then retried, and the next one lands where it is honoured.
+        # Unlike `await task`, asyncio.wait() does not raise the CancelledError
+        # we cause, while a cancellation of disconnect() itself still propagates.
+        deadline = time.monotonic() + self._LISTENER_STOP_TIMEOUT
         while True:
-            event = await self._backend.next_published()
+            task.cancel()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return task.done()
+            done, _ = await asyncio.wait({task}, timeout=min(0.05, remaining))
+            if done:
+                return True
+
+    async def _listener(self, stop: asyncio.Event) -> None:
+        # Supervised loop: an error from the backend must not end the listener,
+        # otherwise every current and future subscriber silently gets nothing.
+        # Log, back off and keep reading.
+        failures = 0
+        last_logged = 0.0
+        while not stop.is_set():
+            try:
+                event = await self._backend.next_published()
+            except Exception:
+                if stop.is_set():
+                    return
+                failures += 1
+                now = time.monotonic()
+                if failures == 1 or now - last_logged >= self._LISTENER_LOG_INTERVAL:
+                    logger.error(
+                        "Error reading from the broadcast backend (%d consecutive failure%s); retrying",
+                        failures,
+                        "" if failures == 1 else "s",
+                        exc_info=True,
+                    )
+                    last_logged = now
+                delay = min(self._LISTENER_BACKOFF_INITIAL * 2 ** (failures - 1), self._LISTENER_BACKOFF_MAX)
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=delay)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+
+            if stop.is_set():
+                return
+            if failures:
+                logger.warning("Broadcast backend recovered after %d consecutive failure(s)", failures)
+                failures = 0
             for queue in list(self._subscribers.get(event.channel, [])):
                 await queue.put(event)
 

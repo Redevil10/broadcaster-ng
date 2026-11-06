@@ -100,14 +100,21 @@ class RedisStreamBackend(BroadcastBackend):
 
     async def unsubscribe(self, channel: str) -> None:
         self.streams.pop(channel, None)
+        if not self.streams:
+            # Nothing left to read: let wait_for_messages() wait again instead of
+            # calling XREAD with no streams (which raises DataError).
+            self._ready.clear()
 
     async def publish(self, channel: str, message: typing.Any) -> None:
         await self._producer.xadd(channel, {"message": message})
 
     async def wait_for_messages(self) -> list[StreamMessageType]:
-        await self._ready.wait()
         messages = None
         while not messages:
+            await self._ready.wait()
+            if not self.streams:  # unsubscribed from the last stream meanwhile
+                self._ready.clear()
+                continue
             messages = await self._consumer.xread(self.streams, count=1, block=100)
         # redis-py >= 6 types xread() as a RESP2/RESP3 union; with RESP2 it is this list.
         return typing.cast(list[StreamMessageType], messages)
