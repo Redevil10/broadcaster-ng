@@ -28,11 +28,16 @@ jobs:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
         redis-py: ["latest"]
         include:
-          # Oldest supported redis-py major.
+          # Oldest supported redis-py major (the backend relies on PubSub internals).
           - python-version: "3.10"
             redis-py: "5"
           - python-version: "3.14"
             redis-py: "5"
+          # Every supported redis-py major in between.
+          - python-version: "3.12"
+            redis-py: "6"
+          - python-version: "3.12"
+            redis-py: "7"
 
     services:
       kafka:
