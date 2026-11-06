@@ -144,6 +144,7 @@ class PsycopgBackend(BroadcastBackend):
         self._publish_lock = asyncio.Lock()
         self._listen_queue: asyncio.Queue[Event] = asyncio.Queue()
         self._stop = asyncio.Event()
+        self._release_tasks: set[asyncio.Task[None]] = set()
         self._reader: asyncio.Task[None] | None = None
         self._last_seen = 0.0
         self._down_since: float | None = None
@@ -157,6 +158,8 @@ class PsycopgBackend(BroadcastBackend):
 
     async def disconnect(self) -> None:
         self._stop.set()
+        for task in list(self._release_tasks):
+            await stop_task(task, self._STOP_TIMEOUT)
         reader, self._reader = self._reader, None
         if reader is not None and not await stop_task(reader, self._STOP_TIMEOUT):
             logger.warning("Postgres reader did not stop within %g s", self._STOP_TIMEOUT)
@@ -173,10 +176,15 @@ class PsycopgBackend(BroadcastBackend):
         self._channels.add(channel)
         try:
             await self._subscribe(channel)
-        except BaseException:
+        except BaseException as exc:
             # Failed or cancelled: Broadcast will not call unsubscribe() for
             # it, so it must not stay in `_channels` (re-LISTENed forever).
             self._channels.discard(channel)
+            if isinstance(exc, asyncio.CancelledError):
+                # The command may still reach the server (or already has):
+                # undo it once it is done, so the server does not keep
+                # sending this channel's messages.
+                self._schedule_release(channel)
             raise
 
     async def _subscribe(self, channel: str) -> None:
@@ -206,7 +214,19 @@ class PsycopgBackend(BroadcastBackend):
 
     async def unsubscribe(self, channel: str) -> None:
         self._channels.discard(channel)
+        await self._send_unsubscribe(channel)
+
+    def _schedule_release(self, channel: str) -> None:
+        if self._stop.is_set():
+            return
+        task = asyncio.ensure_future(self._send_unsubscribe(channel, release=True))
+        self._release_tasks.add(task)
+        task.add_done_callback(self._release_tasks.discard)
+
+    async def _send_unsubscribe(self, channel: str, release: bool = False) -> None:
         async with self._lock:
+            if channel in self._channels:
+                return  # subscribed again meanwhile
             conn = self._conn
             if conn is None:
                 return  # a reconnect will not LISTEN it again

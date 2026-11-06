@@ -9,6 +9,7 @@ import asyncio
 import logging
 import time
 import typing
+import uuid
 from collections.abc import AsyncIterator, Iterator
 
 import pytest
@@ -471,3 +472,41 @@ async def test_subscribe_reply_read_before_the_call_returns_is_not_awaited_again
                 async with broadcast.subscribe("chatroom"):
                     await asyncio.sleep(1.0)
     assert caplog.text == ""
+
+
+@pytest.mark.asyncio
+async def test_cancelled_subscribe_is_undone_on_the_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Cancelled after SUBSCRIBE was sent: the server must not stay subscribed.
+    channel = f"orphan_{uuid.uuid4().hex[:8]}"
+    original = PubSub.subscribe
+    sent = asyncio.Event()
+
+    async def sent_then_slow(self: PubSub, *args: typing.Any, **kwargs: typing.Any) -> None:
+        await original(self, *args, **kwargs)
+        sent.set()
+        await asyncio.sleep(10)
+
+    direct = redis.Redis.from_url("redis://localhost:6379")
+    try:
+        async with Broadcast("redis://localhost:6379") as broadcast:
+            async with broadcast.subscribe("other"):
+                monkeypatch.setattr(PubSub, "subscribe", sent_then_slow)
+
+                async def join() -> None:
+                    async with broadcast.subscribe(channel):
+                        pass  # pragma: no cover
+
+                task = asyncio.create_task(join())
+                await sent.wait()
+                assert await direct.pubsub_numsub(channel) == [(channel.encode(), 1)]
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                monkeypatch.undo()
+                for _ in range(50):
+                    if await direct.pubsub_numsub(channel) == [(channel.encode(), 0)]:
+                        break
+                    await asyncio.sleep(0.05)
+                assert await direct.pubsub_numsub(channel) == [(channel.encode(), 0)]
+                assert await direct.pubsub_numsub("other") == [(b"other", 1)]
+    finally:
+        await direct.aclose()

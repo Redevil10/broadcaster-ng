@@ -430,3 +430,28 @@ async def test_connection_lost_right_after_opening_backs_off(monkeypatch: pytest
             await asyncio.sleep(1.0)
     # Backoff 0.05 s doubling to 0.2 s: about 6 attempts, not hundreds.
     assert 1 <= opens <= 10
+
+
+@pytest.mark.asyncio
+async def test_cancelled_listen_is_undone_on_the_server() -> None:
+    backend = PsycopgBackend(psycopg_url())
+    async with Broadcast(backend=backend) as broadcast:
+        async with broadcast.subscribe("chatroom"):
+            conn = backend._conn
+            assert conn is not None
+            busy = asyncio.create_task(conn.execute("SELECT pg_sleep(0.3)"))  # LISTEN queues behind it
+            await asyncio.sleep(0.05)
+
+            async def join() -> None:
+                async with broadcast.subscribe("orphan"):
+                    pass  # pragma: no cover
+
+            task = asyncio.create_task(join())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await busy
+            await asyncio.sleep(0.2)  # the background LISTEN, then the UNLISTEN
+            async with backend._lock:
+                cur = await conn.execute("SELECT pg_listening_channels()")
+                assert [row[0] for row in await cur.fetchall()] == ["chatroom"]

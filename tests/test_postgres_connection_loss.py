@@ -509,3 +509,39 @@ async def test_connection_lost_right_after_opening_backs_off(monkeypatch: pytest
             await asyncio.sleep(1.0)
     # Backoff 0.05 s doubling to 0.2 s: about 6 attempts, not hundreds.
     assert 1 <= opens <= 10
+
+
+@pytest.mark.asyncio
+async def test_cancelled_listen_is_undone_on_the_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Cancelled after LISTEN ran but before asyncpg registered the channel, so
+    # remove_listener() alone would do nothing.
+    async with Broadcast(POSTGRES_URL) as broadcast:
+        backend = listener_backend(broadcast)
+        async with broadcast.subscribe("chatroom"):
+            conn = backend._conn
+            assert conn is not None
+            original = type(conn).add_listener
+            listened = asyncio.Event()
+
+            async def add_listener(self: typing.Any, channel: str, callback: typing.Any) -> None:
+                if channel != "orphan":
+                    await original(self, channel, callback)
+                    return
+                await self.execute('LISTEN "orphan"')
+                listened.set()
+                await asyncio.sleep(10)
+
+            monkeypatch.setattr(type(conn), "add_listener", add_listener)
+
+            async def join() -> None:
+                async with broadcast.subscribe("orphan"):
+                    pass  # pragma: no cover
+
+            task = asyncio.create_task(join())
+            await listened.wait()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.sleep(0.2)
+            async with backend._lock:
+                channels = await conn.fetchval("SELECT array_agg(c) FROM pg_listening_channels() c")
+            assert channels == ["chatroom"]

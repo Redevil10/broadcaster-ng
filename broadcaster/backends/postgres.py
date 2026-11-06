@@ -26,6 +26,10 @@ def _describe(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
+def _quote(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
 def _check_channel(channel: str) -> None:
     # Rejected by the server or the driver; caught here so the error is clear.
     if not channel or "\x00" in channel:
@@ -124,6 +128,7 @@ class PostgresBackend(BroadcastBackend):
         self._listen_queue: asyncio.Queue[Event] = asyncio.Queue()
         self._pool: asyncpg.Pool | None = None
         self._stop = asyncio.Event()
+        self._release_tasks: set[asyncio.Task[None]] = set()
         self._reader: asyncio.Task[None] | None = None
         self._last_seen = 0.0
         self._down_since: float | None = None
@@ -151,6 +156,8 @@ class PostgresBackend(BroadcastBackend):
 
     async def disconnect(self) -> None:
         self._stop.set()
+        for task in list(self._release_tasks):
+            await stop_task(task, self._STOP_TIMEOUT)
         self._wake.set()
         reader, self._reader = self._reader, None
         if reader is not None and not await stop_task(reader, self._STOP_TIMEOUT):
@@ -171,10 +178,15 @@ class PostgresBackend(BroadcastBackend):
         self._channels.add(channel)
         try:
             await self._subscribe(channel)
-        except BaseException:
+        except BaseException as exc:
             # Failed or cancelled: Broadcast will not call unsubscribe() for
             # it, so it must not stay in `_channels` (re-LISTENed forever).
             self._channels.discard(channel)
+            if isinstance(exc, asyncio.CancelledError):
+                # The command may still reach the server (or already has):
+                # undo it once it is done, so the server does not keep
+                # sending this channel's messages.
+                self._schedule_release(channel)
             raise
 
     async def _subscribe(self, channel: str) -> None:
@@ -204,12 +216,29 @@ class PostgresBackend(BroadcastBackend):
 
     async def unsubscribe(self, channel: str) -> None:
         self._channels.discard(channel)
+        await self._send_unsubscribe(channel)
+
+    def _schedule_release(self, channel: str) -> None:
+        if self._stop.is_set():
+            return
+        task = asyncio.ensure_future(self._send_unsubscribe(channel, release=True))
+        self._release_tasks.add(task)
+        task.add_done_callback(self._release_tasks.discard)
+
+    async def _send_unsubscribe(self, channel: str, release: bool = False) -> None:
         async with self._lock:
+            if channel in self._channels:
+                return  # subscribed again meanwhile
             conn = self._conn
             if conn is None:
                 return  # a reconnect will not LISTEN it again
             try:
                 await asyncio.wait_for(conn.remove_listener(channel, self._listener), self._COMMAND_TIMEOUT)
+                if release:
+                    # remove_listener() does nothing if add_listener() was
+                    # interrupted before it registered the channel, though
+                    # its LISTEN may have run.
+                    await asyncio.wait_for(conn.execute(f"UNLISTEN {_quote(channel)}"), self._COMMAND_TIMEOUT)
             except Exception as exc:
                 logger.warning(
                     "Postgres connection lost while unsubscribing from %r (%s); reconnecting", channel, _describe(exc)
