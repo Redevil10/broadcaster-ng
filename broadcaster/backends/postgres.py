@@ -74,7 +74,8 @@ def _apply_keepalive(conn: asyncpg.Connection, options: dict[str, int]) -> None:
         ("keepalives_interval", getattr(socket, "TCP_KEEPINTVL", None)),
         ("keepalives_count", getattr(socket, "TCP_KEEPCNT", None)),
     ):
-        if key in options and option is not None:
+        # 0 means "use the system default" in libpq; the socket option rejects it.
+        if options.get(key) and option is not None:
             sock.setsockopt(socket.IPPROTO_TCP, option, options[key])
 
 

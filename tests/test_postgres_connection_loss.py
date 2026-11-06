@@ -21,7 +21,7 @@ import pytest_asyncio
 
 from broadcaster import Broadcast, Event
 from broadcaster._base import Subscriber
-from broadcaster.backends.postgres import PostgresBackend, _split_keepalive_params
+from broadcaster.backends.postgres import PostgresBackend, _apply_keepalive, _split_keepalive_params
 
 from .tcp_proxy import TcpProxy
 
@@ -455,3 +455,30 @@ async def test_application_name_in_url_is_kept() -> None:
         assert conn is not None
         async with listener_backend(broadcast)._lock:
             assert await conn.fetchval("SHOW application_name") == name
+
+
+def test_zero_keepalive_settings_mean_system_default() -> None:
+    # libpq: 0 means "use the system default". Linux rejects 0 for these socket
+    # options (EINVAL), so they must not be passed through.
+    calls: list[tuple[int, int, int]] = []
+
+    class FakeSocket:
+        family = socket.AF_INET
+
+        def setsockopt(self, level: int, option: int, value: int) -> None:
+            if value == 0:
+                raise OSError(22, "Invalid argument")
+            calls.append((level, option, value))
+
+    class FakeTransport:
+        def get_extra_info(self, name: str) -> FakeSocket:
+            return FakeSocket()
+
+    class FakeConnection:
+        _transport = FakeTransport()
+
+    _apply_keepalive(
+        typing.cast(asyncpg.Connection, FakeConnection()),
+        {"keepalives_idle": 0, "keepalives_interval": 0, "keepalives_count": 0},
+    )
+    assert calls == [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
