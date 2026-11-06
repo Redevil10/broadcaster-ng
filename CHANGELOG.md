@@ -55,7 +55,8 @@ API and the `broadcaster` import name are unchanged.
   Custom backends can trigger it with `self._notify_reconnect(channels,
   downtime)`.
 - Logging on the `broadcaster` logger for connection loss, reconnects and
-  failed reconnects.
+  failed reconnects. The Redis and Postgres reader tasks are supervised: if
+  one ever stops unexpectedly it is logged and restarted.
 - Includes the unreleased changes from encode/broadcaster master after 0.3.1:
   public `broadcaster.backends` module (the old `broadcaster._backends` path
   still works), `RedisBackend(conn=...)` for a preconfigured client, and

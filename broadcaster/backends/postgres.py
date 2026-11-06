@@ -113,7 +113,7 @@ class PostgresBackend(BroadcastBackend):
         except BaseException:
             await self._pool.close()
             raise
-        self._reader = asyncio.create_task(self._run())
+        self._start_reader()
 
     async def disconnect(self) -> None:
         self._stop.set()
@@ -236,6 +236,27 @@ class PostgresBackend(BroadcastBackend):
             await asyncio.wait_for(conn.close(), self._COMMAND_TIMEOUT)
         except Exception:
             conn.terminate()
+
+    _READER_RESTART_DELAY = 1.0
+
+    def _start_reader(self) -> None:
+        if self._stop.is_set():
+            return
+        self._reader = asyncio.create_task(self._run())
+        self._reader.add_done_callback(self._on_reader_done)
+
+    def _on_reader_done(self, task: asyncio.Task[None]) -> None:
+        # The reader handles connection errors itself and only returns when
+        # stopped. If it ever ends otherwise (a bug), say so and restart it, so
+        # delivery never stops silently.
+        if task.cancelled() or self._stop.is_set() or task is not self._reader:
+            return
+        logger.error(
+            "Postgres reader stopped unexpectedly; restarting in %g s",
+            self._READER_RESTART_DELAY,
+            exc_info=task.exception(),
+        )
+        asyncio.get_running_loop().call_later(self._READER_RESTART_DELAY, self._start_reader)
 
     async def _run(self) -> None:
         failures = 0

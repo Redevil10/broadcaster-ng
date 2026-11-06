@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import typing
 from collections.abc import AsyncIterator, Iterator
 
 import pytest
@@ -330,3 +331,28 @@ async def test_leaving_subscription_on_dead_connection(proxy: TcpProxy, caplog: 
                 assert "no reply from Redis" in caplog.text
                 proxy.unmute()
                 await publish_until_received(broadcast, other, "other")
+
+
+@pytest.mark.asyncio
+async def test_reader_crash_is_logged_and_restarted(
+    proxy: TcpProxy, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # An unexpected error escaping the reader loop must not stop delivery silently.
+    backend_cls = RedisBackend
+    monkeypatch.setattr(backend_cls, "_READER_RESTART_DELAY", 0.05)
+    original_run = backend_cls._run
+    crashes: list[int] = []
+
+    async def crash_once(self: typing.Any) -> None:
+        if not crashes:
+            crashes.append(1)
+            raise RuntimeError("bug in reader")
+        await original_run(self)
+
+    monkeypatch.setattr(backend_cls, "_run", crash_once)
+    with caplog.at_level(logging.ERROR, logger="broadcaster"):
+        async with Broadcast(proxied_url(proxy)) as broadcast:
+            async with broadcast.subscribe("chatroom") as subscriber:
+                await publish_until_received(broadcast, subscriber)
+    assert "reader stopped unexpectedly" in caplog.text
+    assert "bug in reader" in caplog.text
