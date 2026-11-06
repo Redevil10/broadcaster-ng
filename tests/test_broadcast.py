@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import typing
 
 import pytest
@@ -9,6 +10,10 @@ from redis import asyncio as redis
 from broadcaster import Broadcast, BroadcastBackend, Event
 from broadcaster.backends.kafka import KafkaBackend
 from broadcaster.backends.redis import RedisBackend
+
+POSTGRES_URL = os.environ.get(
+    "BROADCASTER_TEST_POSTGRES_URL", "postgres://postgres:postgres@localhost:5432/broadcaster"
+)
 
 
 class CustomBackend(BroadcastBackend):
@@ -92,7 +97,7 @@ async def test_redis_stream():
 
 @pytest.mark.asyncio
 async def test_postgres():
-    async with Broadcast("postgres://postgres:postgres@localhost:5432/broadcaster") as broadcast:
+    async with Broadcast(POSTGRES_URL) as broadcast:
         async with broadcast.subscribe("chatroom") as subscriber:
             await broadcast.publish("chatroom", "hello")
             event = await subscriber.get()

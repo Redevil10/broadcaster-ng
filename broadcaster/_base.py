@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, cast
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlparse
 
 if TYPE_CHECKING:  # pragma: no cover

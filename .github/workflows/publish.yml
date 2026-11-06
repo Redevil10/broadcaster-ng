@@ -1,9 +1,9 @@
 name: Publish
 
+# Disabled until the package is set up on PyPI with trusted publishing.
+# Tag pushes must not publish anything yet.
 on:
-  push:
-    tags:
-      - "*"
+  workflow_dispatch:
 
 jobs:
   publish:

@@ -3,62 +3,63 @@ name: Test Suite
 
 on:
   push:
-    branches: ["master"]
+    branches: ["main"]
   pull_request:
-    branches: ["master"]
+    branches: ["main"]
 
 jobs:
   tests:
-    name: "Python ${{ matrix.python-version }}"
+    name: "Python ${{ matrix.python-version }} / redis-py ${{ matrix.redis-py }}"
     runs-on: "ubuntu-latest"
 
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        redis-py: ["latest"]
+        include:
+          # Oldest supported redis-py major.
+          - python-version: "3.10"
+            redis-py: "5"
+          - python-version: "3.14"
+            redis-py: "5"
 
     services:
-      zookeeper:
-        image: confluentinc/cp-zookeeper
-        ports:
-        - 32181:32181
-        env:
-          ZOOKEEPER_CLIENT_PORT: 32181
-          ALLOW_ANONYMOUS_LOGIN: yes
-        options: --hostname zookeeper
       kafka:
-        image: confluentinc/cp-kafka
+        # Single-node KRaft broker; default config listens on localhost:9092.
+        image: apache/kafka:3.9.1
         ports:
-        - 9092:9092
-        - 29092:29092
-        env:
-          KAFKA_ZOOKEEPER_CONNECT: "zookeeper:32181"
-          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
-          KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT_HOST://localhost:29092,PLAINTEXT://localhost:9092"
-          KAFKA_BROKER_ID: 1
-          ALLOW_PLAINTEXT_LISTENER: yes
-        options: --hostname kafka
+          - 9092:9092
       redis:
-        image: redis:alpine
+        image: redis:7-alpine
         ports:
-        - 6379:6379
+          - 6379:6379
       postgres:
-        image: postgres:12
+        image: postgres:16
         env:
           POSTGRES_DB: broadcaster
           POSTGRES_PASSWORD: postgres
           POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_USER: postgres
         ports:
-        - 5432:5432
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
 
     steps:
-      - uses: "actions/checkout@v2"
-      - uses: "actions/setup-python@v2"
+      - uses: "actions/checkout@v4"
+      - uses: "actions/setup-python@v5"
         with:
           python-version: "${{ matrix.python-version }}"
+          allow-prereleases: true
       - name: "Install dependencies"
         run: "scripts/install"
+      - name: "Pin redis-py major"
+        if: matrix.redis-py != 'latest'
+        run: pip install "redis==${{ matrix.redis-py }}.*"
       - name: "Run linting checks"
         run: "scripts/check"
       - name: "Build package & docs"

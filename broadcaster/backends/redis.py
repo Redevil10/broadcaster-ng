@@ -66,7 +66,7 @@ class RedisBackend(BroadcastBackend):
             self._ready.clear()
 
 
-StreamMessageType = typing.Tuple[bytes, typing.Tuple[typing.Tuple[bytes, typing.Dict[bytes, bytes]]]]
+StreamMessageType = tuple[bytes, tuple[tuple[bytes, dict[bytes, bytes]]]]
 
 
 class RedisStreamBackend(BroadcastBackend):
@@ -104,7 +104,8 @@ class RedisStreamBackend(BroadcastBackend):
         messages = None
         while not messages:
             messages = await self._consumer.xread(self.streams, count=1, block=100)
-        return messages
+        # redis-py >= 6 types xread() as a RESP2/RESP3 union; with RESP2 it is this list.
+        return typing.cast(list[StreamMessageType], messages)
 
     async def next_published(self) -> Event:
         messages = await self.wait_for_messages()
