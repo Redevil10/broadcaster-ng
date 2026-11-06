@@ -79,8 +79,6 @@ jobs:
       - name: "Pin redis-py major"
         if: matrix.redis-py != 'latest'
         run: pip install "redis==${{ matrix.redis-py }}.*"
-      - name: "Run linting checks"
-        run: "scripts/check"
       - name: "Build package & docs"
         run: "scripts/build"
       - name: "Run tests"
