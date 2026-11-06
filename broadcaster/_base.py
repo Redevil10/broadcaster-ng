@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, cast
@@ -8,6 +9,8 @@ from urllib.parse import urlparse
 
 if TYPE_CHECKING:  # pragma: no cover
     from broadcaster.backends.base import BroadcastBackend
+
+logger = logging.getLogger("broadcaster")
 
 
 class Event:
@@ -31,6 +34,7 @@ class Broadcast:
         assert url or backend, "Either `url` or `backend` must be provided."
         self._backend = backend or self._create_backend(cast(str, url))
         self._subscribers: dict[str, set[asyncio.Queue[Event | None]]] = {}
+        self._channel_locks: dict[str, _ChannelLock] = {}
 
     def _create_backend(self, url: str) -> BroadcastBackend:
         parsed_url = urlparse(url)
@@ -91,20 +95,66 @@ class Broadcast:
     async def subscribe(self, channel: str) -> AsyncIterator[Subscriber]:
         queue: asyncio.Queue[Event | None] = asyncio.Queue()
 
+        # If this raises (e.g. the backend is unreachable), nothing has been
+        # registered, so the caller sees the backend's own error.
+        await self._add_subscriber(channel, queue)
         try:
-            if not self._subscribers.get(channel):
-                await self._backend.subscribe(channel)
-                self._subscribers[channel] = {queue}
-            else:
-                self._subscribers[channel].add(queue)
-
             yield Subscriber(queue)
         finally:
-            self._subscribers[channel].remove(queue)
-            if not self._subscribers.get(channel):
-                del self._subscribers[channel]
-                await self._backend.unsubscribe(channel)
+            await self._remove_subscriber(channel, queue)
             await queue.put(None)
+
+    async def _add_subscriber(self, channel: str, queue: asyncio.Queue[Event | None]) -> None:
+        # The lock makes concurrent first subscribers to a channel wait for one
+        # backend subscribe instead of each subscribing and overwriting the
+        # other's registration.
+        async with self._channel_lock(channel):
+            subscribers = self._subscribers.get(channel)
+            if subscribers is not None:
+                subscribers.add(queue)
+                return
+            # Register only after the backend subscribe succeeded.
+            await self._backend.subscribe(channel)
+            self._subscribers[channel] = {queue}
+
+    async def _remove_subscriber(self, channel: str, queue: asyncio.Queue[Event | None]) -> None:
+        async with self._channel_lock(channel):
+            subscribers = self._subscribers.get(channel)
+            if subscribers is None or queue not in subscribers:
+                return
+            subscribers.discard(queue)
+            if subscribers:
+                return
+            del self._subscribers[channel]
+            try:
+                await self._backend.unsubscribe(channel)
+            except Exception:
+                # Leaving a subscription must not fail, and must not replace an
+                # exception raised inside the `async with` block. The local state
+                # is already cleaned up; a dead connection drops the server-side
+                # subscription anyway.
+                logger.warning("Failed to unsubscribe from channel %r", channel, exc_info=True)
+
+    @asynccontextmanager
+    async def _channel_lock(self, channel: str) -> AsyncIterator[None]:
+        entry = self._channel_locks.get(channel)
+        if entry is None:
+            entry = self._channel_locks[channel] = _ChannelLock()
+        entry.users += 1
+        try:
+            async with entry.lock:
+                yield
+        finally:
+            entry.users -= 1
+            if entry.users == 0:
+                # Drop unused locks so short-lived channels do not accumulate.
+                del self._channel_locks[channel]
+
+
+class _ChannelLock:
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.users = 0
 
 
 class Subscriber:
