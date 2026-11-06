@@ -31,8 +31,11 @@ API and the `broadcaster` import name are unchanged.
 - Postgres: reconnects and re-runs `LISTEN` after connection loss
   (encode/broadcaster#66); detects half-open connections with a heartbeat
   query; concurrent subscribes no longer fail with "another operation is in
-  progress" (encode/broadcaster#22); publishing uses a separate connection
-  pool.
+  progress" (encode/broadcaster#22); publishing uses a separate connection.
+  A `LISTEN` the server rejects is raised to the caller instead of
+  disconnecting every channel; an empty channel name raises `ValueError`.
+- A subscribe that fails or is cancelled (e.g. a websocket handler cancelled
+  during an outage) no longer leaves the channel subscribed in the backend.
 - Kafka: unsubscribing one channel no longer unsubscribes every channel
   (encode/broadcaster#65), and changing subscriptions no longer loses
   messages on the other channels.
@@ -56,7 +59,8 @@ API and the `broadcaster` import name are unchanged.
   already logged when it happened).
 - Postgres URLs accept libpq keepalive parameters (`keepalives`,
   `keepalives_idle`, `keepalives_interval`, `keepalives_count`); TCP keepalive
-  is on by default.
+  is on by default. The listener connection is named `broadcaster-listener`
+  unless the URL sets `application_name`.
 
 ### Added
 

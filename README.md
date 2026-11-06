@@ -167,7 +167,9 @@ Drops are logged (at most once a minute) and counted in
   `keepalives_idle`, `keepalives_interval` and `keepalives_count`. TCP keepalive
   is on by default, as in libpq; `keepalives=0` turns it off.
 * The Postgres listener connection is named `broadcaster-listener` in
-  `pg_stat_activity`. Publishing uses a separate small connection pool.
+  `pg_stat_activity`, unless the URL sets `application_name`. Publishing uses
+  one separate connection, so each `Broadcast` holds two server connections.
+* The psycopg backend needs psycopg 3.2.4 or newer.
 
 ### Logging
 
