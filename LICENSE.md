@@ -1,4 +1,5 @@
 Copyright © 2020, [Encode OSS Ltd](https://www.encode.io/).
+Copyright © 2026, Qing Wan.
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without

@@ -18,6 +18,9 @@ jobs:
   tests:
     name: "Python ${{ matrix.python-version }} / redis-py ${{ matrix.redis-py }}"
     runs-on: "ubuntu-latest"
+    # A hang (e.g. a subscriber that never receives) should fail fast,
+    # not run until GitHub's 6-hour limit.
+    timeout-minutes: 10
 
     strategy:
       fail-fast: false
