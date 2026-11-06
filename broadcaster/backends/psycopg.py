@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections.abc import Awaitable
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import psycopg
 from psycopg import sql
+from psycopg.conninfo import conninfo_to_dict
 
 from .._base import Event
 from .._utils import stop_task, wait_any, wait_or_stop
@@ -115,6 +117,18 @@ class PsycopgBackend(BroadcastBackend):
 
     def __init__(self, url: str):
         self._url = _libpq_url(url)
+        # Settings given in the URL (or libpq's environment variables) win over
+        # our defaults.
+        params = conninfo_to_dict(self._url)
+        self._name_connections = "application_name" not in params and "PGAPPNAME" not in os.environ
+        user_timeout = params.get("connect_timeout") or os.environ.get("PGCONNECT_TIMEOUT")
+        self._connect_kwargs: dict[str, Any] = {}
+        self._connect_deadline = self._CONNECT_TIMEOUT
+        if user_timeout:
+            # Let libpq apply the user's timeout; only add a safety margin.
+            self._connect_deadline = max(self._CONNECT_TIMEOUT, float(user_timeout) + 1)
+        else:
+            self._connect_kwargs["connect_timeout"] = max(1, round(self._CONNECT_TIMEOUT))
         # Channels that currently have subscribers: what to (re)LISTEN.
         self._channels: set[str] = set()
         # The live LISTEN connection, or None while disconnected. Invariant:
@@ -225,14 +239,16 @@ class PsycopgBackend(BroadcastBackend):
         await conn.execute(sql.SQL(command + " {}").format(sql.Identifier(channel)))
 
     async def _new_connection(self, application_name: str) -> Connection:
+        kwargs = dict(self._connect_kwargs)
+        if self._name_connections:
+            kwargs["application_name"] = application_name
         return await asyncio.wait_for(
             psycopg.AsyncConnection.connect(
                 self._url,
                 autocommit=True,  # a LISTEN connection must not sit in a transaction
-                connect_timeout=max(1, round(self._CONNECT_TIMEOUT)),
-                application_name=application_name,
+                **kwargs,
             ),
-            self._CONNECT_TIMEOUT,
+            self._connect_deadline,
         )
 
     async def _open(self) -> None:

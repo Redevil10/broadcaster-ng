@@ -11,6 +11,7 @@ import os
 import socket
 import time
 import typing
+import uuid
 from collections.abc import AsyncIterator, Iterator
 from urllib.parse import urlsplit, urlunsplit
 
@@ -443,3 +444,14 @@ async def test_listen_rejected_by_server_does_not_drop_the_connection(monkeypatc
             assert "bad" not in backend._channels
             await broadcast.publish("chatroom", "still here")
             assert (await asyncio.wait_for(subscriber.get(), 2)).message == "still here"
+
+
+@pytest.mark.asyncio
+async def test_application_name_in_url_is_kept() -> None:
+    name = f"myapp-{uuid.uuid4().hex[:8]}"
+    url = urlunsplit(urlsplit(POSTGRES_URL)._replace(query=f"application_name={name}"))
+    async with Broadcast(url) as broadcast:
+        conn = listener_backend(broadcast)._conn
+        assert conn is not None
+        async with listener_backend(broadcast)._lock:
+            assert await conn.fetchval("SHOW application_name") == name

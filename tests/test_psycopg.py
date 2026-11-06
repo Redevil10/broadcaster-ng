@@ -391,3 +391,15 @@ async def test_invalid_channel_name() -> None:
         with pytest.raises(ValueError, match="invalid Postgres channel name"):
             async with broadcast.subscribe(""):
                 pass  # pragma: no cover
+
+
+@pytest.mark.asyncio
+async def test_application_name_and_connect_timeout_in_url_are_kept() -> None:
+    backend = PsycopgBackend(psycopg_url(query="application_name=myapp&connect_timeout=15"))
+    async with Broadcast(backend=backend):
+        conn = backend._conn
+        assert conn is not None
+        assert conn.info.get_parameters()["connect_timeout"] == "15"
+        async with backend._lock:
+            cur = await conn.execute("SHOW application_name")
+            assert await cur.fetchone() == ("myapp",)

@@ -5,7 +5,7 @@ import logging
 import socket
 import time
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import parse_qsl, unquote
 
 import asyncpg
 
@@ -97,11 +97,16 @@ class PostgresBackend(BroadcastBackend):
     _RECONNECT_BACKOFF_MAX = 5.0
     _LOG_INTERVAL = 60.0
     _STOP_TIMEOUT = 5.0
-    _PUBLISH_POOL_MAX_SIZE = 5
+    # One publish connection (plus the LISTEN connection) per Broadcast, so
+    # many worker processes do not exhaust max_connections.
+    _PUBLISH_POOL_MAX_SIZE = 1
     _APPLICATION_NAME = "broadcaster-listener"
 
     def __init__(self, url: str):
         self._url, self._keepalive = _split_keepalive_params(url)
+        # Name the LISTEN connection, unless the URL already names it.
+        url_params = {key for key, _ in parse_qsl(self._url.partition("?")[2])}
+        self._server_settings = {} if "application_name" in url_params else {"application_name": self._APPLICATION_NAME}
         # Channels that currently have subscribers: what to (re)LISTEN.
         self._channels: set[str] = set()
         # The live LISTEN connection, or None while disconnected. Invariant:
@@ -237,7 +242,7 @@ class PostgresBackend(BroadcastBackend):
             self._url,
             timeout=self._CONNECT_TIMEOUT,
             command_timeout=self._COMMAND_TIMEOUT,
-            server_settings={"application_name": self._APPLICATION_NAME},
+            server_settings=self._server_settings,
         )
         try:
             _apply_keepalive(conn, self._keepalive)
