@@ -395,3 +395,15 @@ async def test_disconnect_during_heartbeat_on_half_open_link_is_prompt(proxy: Tc
         started = time.monotonic()
         await asyncio.wait_for(broadcast.disconnect(), 10)
     assert time.monotonic() - started < 2
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("postgresql:///db?host=/var/run/postgresql", "postgresql:///db?host=/var/run/postgresql"),
+        ("postgresql:///db?keepalives=0&host=%2Ftmp", "postgresql:///db?host=%2Ftmp"),
+        ("postgres://h/db?keepalives_idle=7", "postgres://h/db"),
+    ],
+)
+def test_split_keepalive_params_leaves_the_rest_of_the_dsn_alone(url: str, expected: str) -> None:
+    assert _split_keepalive_params(url)[0] == expected

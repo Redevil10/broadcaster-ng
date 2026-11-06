@@ -5,7 +5,6 @@ import logging
 import time
 from collections.abc import Awaitable
 from typing import TypeVar
-from urllib.parse import urlsplit, urlunsplit
 
 import psycopg
 from psycopg import sql
@@ -58,8 +57,9 @@ def _describe(exc: BaseException) -> str:
 
 def _libpq_url(url: str) -> str:
     """postgres+psycopg://... or postgresql+psycopg://... -> postgresql://..."""
-    parts = urlsplit(url)
-    return urlunsplit(parts._replace(scheme="postgresql"))
+    # Replace only the scheme: a urlsplit/urlunsplit round trip would turn
+    # postgres+psycopg:///db (the Unix-socket form) into postgresql:/db.
+    return "postgresql" + url[url.index(":") :]
 
 
 class PsycopgBackend(BroadcastBackend):

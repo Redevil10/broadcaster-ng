@@ -14,12 +14,13 @@ from collections.abc import AsyncIterator, Iterator
 from urllib.parse import urlsplit, urlunsplit
 
 import psycopg
+import psycopg.conninfo
 import pytest
 import pytest_asyncio
 
 from broadcaster import Broadcast, Event
 from broadcaster._base import Subscriber
-from broadcaster.backends.psycopg import PsycopgBackend
+from broadcaster.backends.psycopg import PsycopgBackend, _libpq_url
 
 from .tcp_proxy import TcpProxy
 
@@ -301,3 +302,16 @@ async def test_reader_crash_is_logged_and_restarted(
             async with broadcast.subscribe("chatroom") as subscriber:
                 await publish_until_received(broadcast, subscriber)
     assert "reader stopped unexpectedly" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("postgres+psycopg://u:p@h:5432/db?sslmode=disable", "postgresql://u:p@h:5432/db?sslmode=disable"),
+        # The Unix-socket form: the empty host must keep its "//".
+        ("postgresql+psycopg:///db?host=/var/run/postgresql", "postgresql:///db?host=/var/run/postgresql"),
+    ],
+)
+def test_libpq_url(url: str, expected: str) -> None:
+    assert _libpq_url(url) == expected
+    assert psycopg.conninfo.conninfo_to_dict(_libpq_url(url))["dbname"] == "db"

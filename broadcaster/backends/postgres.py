@@ -5,7 +5,7 @@ import logging
 import socket
 import time
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import unquote
 
 import asyncpg
 
@@ -27,11 +27,19 @@ def _describe(exc: BaseException) -> str:
 
 
 def _split_keepalive_params(url: str) -> tuple[str, dict[str, int]]:
-    parts = urlsplit(url)
-    query = parse_qsl(parts.query, keep_blank_values=True)
-    keepalive = {key: int(value) for key, value in query if key in _KEEPALIVE_PARAMS}
-    rest = [(key, value) for key, value in query if key not in _KEEPALIVE_PARAMS]
-    return urlunsplit(parts._replace(query=urlencode(rest))), keepalive
+    # Edits only the query string and leaves the rest of the DSN exactly as
+    # written: a urlsplit/urlunsplit round trip turns postgresql:///db (the
+    # Unix-socket form) into postgresql:/db, which is no longer a URL.
+    base, sep, query = url.partition("?")
+    keepalive: dict[str, int] = {}
+    rest = []
+    for item in query.split("&") if query else []:
+        key, _, value = item.partition("=")
+        if unquote(key) in _KEEPALIVE_PARAMS:
+            keepalive[unquote(key)] = int(unquote(value))
+        else:
+            rest.append(item)
+    return (base + sep + "&".join(rest) if rest else base), keepalive
 
 
 def _apply_keepalive(conn: asyncpg.Connection, options: dict[str, int]) -> None:
