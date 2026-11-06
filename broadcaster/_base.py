@@ -211,8 +211,10 @@ class Broadcast:
             yield Subscriber(queue)
         finally:
             await self._remove_subscriber(channel, queue)
-            # Wake a reader blocked in get(); never block here on a full queue.
-            _offer(queue, None)
+            # Wake a reader blocked in get(). The queue's storage is unbounded
+            # (the limit applies in offer()), so this never blocks, and it is
+            # not a message: it must not push one out or count as a drop.
+            queue.put_nowait(None)
 
     async def _add_subscriber(self, channel: str, queue: asyncio.Queue[Event | None]) -> None:
         # The lock makes concurrent first subscribers to a channel wait for one

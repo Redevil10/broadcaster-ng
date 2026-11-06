@@ -96,3 +96,15 @@ async def test_invalid_max_queue_size(size: int) -> None:
         with pytest.raises(ValueError, match="max_queue_size"):
             async with broadcast.subscribe("chatroom", max_queue_size=size):
                 pass  # pragma: no cover
+
+
+@pytest.mark.asyncio
+async def test_leaving_with_a_full_queue_is_not_a_drop(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING, logger="broadcaster"):
+        async with Broadcast("memory://") as broadcast:
+            async with broadcast.subscribe("chatroom", max_queue_size=2) as subscriber:
+                for n in range(2):
+                    await broadcast.publish("chatroom", str(n))
+                await flush()
+            assert subscriber.dropped_messages == 0
+    assert "not keeping up" not in caplog.text
