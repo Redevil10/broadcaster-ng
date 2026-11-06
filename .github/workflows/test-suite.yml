@@ -87,3 +87,13 @@ jobs:
         run: "scripts/coverage"
       - name: "API compatibility: unmodified upstream tests"
         run: "python -m pytest -p no:cacheprovider tests_upstream"
+
+  # One stable check for branch protection, whatever the matrix contains.
+  tests-passed:
+    name: "All tests passed"
+    if: always()
+    needs: tests
+    runs-on: "ubuntu-latest"
+    steps:
+      - name: "Check the test matrix result"
+        run: test "${{ needs.tests.result }}" = "success"
