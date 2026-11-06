@@ -1,10 +1,6 @@
 name: Publish
 
 # Runs when a GitHub Release is published (not on plain tag pushes).
-# Uses PyPI trusted publishing: no API token is stored in the repo.
-# One-time setup on PyPI: add a (pending) trusted publisher for project
-# "broadcaster-ng", owner "Redevil10", repo "broadcaster-ng",
-# workflow "publish.yml", environment "pypi".
 on:
   release:
     types: [published]
