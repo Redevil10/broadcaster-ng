@@ -182,3 +182,18 @@ async def test_disconnect_without_connect() -> None:
 async def _until(predicate: Callable[[], bool]) -> None:
     while not predicate():
         await asyncio.sleep(0.001)
+
+
+@pytest.mark.asyncio
+async def test_listener_survives_a_very_long_outage(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The backoff used to compute INITIAL * 2 ** (failures - 1), which raises
+    # OverflowError at failure 1025 and ended the listener for good.
+    monkeypatch.setattr(Broadcast, "_LISTENER_BACKOFF_INITIAL", 0.0)
+    monkeypatch.setattr(Broadcast, "_LISTENER_BACKOFF_MAX", 0.0)
+    backend = FailingBackend()
+    backend.failures_left = 1100
+    async with Broadcast(backend=backend) as broadcast:
+        await asyncio.wait_for(_until(lambda: backend.failures_left == 0), 10)
+        async with broadcast.subscribe("chatroom") as subscriber:
+            await broadcast.publish("chatroom", "hello")
+            assert await asyncio.wait_for(subscriber.get(), 1) == Event("chatroom", "hello")

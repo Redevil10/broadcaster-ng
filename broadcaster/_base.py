@@ -176,7 +176,7 @@ class Broadcast:
                         exc_info=True,
                     )
                     last_logged = now
-                delay = min(self._LISTENER_BACKOFF_INITIAL * 2 ** (failures - 1), self._LISTENER_BACKOFF_MAX)
+                delay = min(self._LISTENER_BACKOFF_INITIAL * 2 ** min(failures - 1, 16), self._LISTENER_BACKOFF_MAX)
                 await wait_or_stop(stop, delay)
                 continue
 

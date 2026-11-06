@@ -278,7 +278,9 @@ class PostgresBackend(BroadcastBackend):
                             "Could not reconnect to Postgres (attempt %d): %s; retrying", failures, _describe(exc)
                         )
                         last_logged = now
-                    delay = min(self._RECONNECT_BACKOFF_INITIAL * 2 ** (failures - 1), self._RECONNECT_BACKOFF_MAX)
+                    delay = min(
+                        self._RECONNECT_BACKOFF_INITIAL * 2 ** min(failures - 1, 16), self._RECONNECT_BACKOFF_MAX
+                    )
                     await wait_or_stop(self._stop, delay)
                     continue
                 if self._down_since is not None:
