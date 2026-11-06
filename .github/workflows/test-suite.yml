@@ -79,6 +79,10 @@ jobs:
       - name: "Pin redis-py major"
         if: matrix.redis-py != 'latest'
         run: pip install "redis==${{ matrix.redis-py }}.*"
+      # Also here, not only in the Lint workflow: redis-py's type hints differ
+      # between majors, so type-check against each one in the matrix.
+      - name: "Type check"
+        run: "mypy broadcaster tests"
       - name: "Build package & docs"
         run: "scripts/build"
       - name: "Run tests"

@@ -181,14 +181,23 @@ class Broadcast:
                 logger.warning("Broadcast backend recovered after %d consecutive failure(s)", failures)
                 failures = 0
             for queue in list(self._subscribers.get(event.channel, [])):
-                await queue.put(event)
+                _offer(queue, event)
 
     async def publish(self, channel: str, message: Any) -> None:
         await self._backend.publish(channel, message)
 
     @asynccontextmanager
-    async def subscribe(self, channel: str) -> AsyncIterator[Subscriber]:
-        queue: asyncio.Queue[Event | None] = asyncio.Queue()
+    async def subscribe(self, channel: str, *, max_queue_size: int | None = None) -> AsyncIterator[Subscriber]:
+        """Subscribe to `channel`.
+
+        By default the subscriber's queue is unbounded. With `max_queue_size`,
+        a subscriber that does not keep up loses its oldest queued messages to
+        make room for new ones (logged, and counted in
+        `Subscriber.dropped_messages`); it never holds up other subscribers.
+        """
+        if max_queue_size is not None and max_queue_size < 1:
+            raise ValueError("max_queue_size must be at least 1")
+        queue = _SubscriberQueue(channel, max_queue_size)
 
         # If this raises (e.g. the backend is unreachable), nothing has been
         # registered, so the caller sees the backend's own error.
@@ -197,7 +206,8 @@ class Broadcast:
             yield Subscriber(queue)
         finally:
             await self._remove_subscriber(channel, queue)
-            await queue.put(None)
+            # Wake a reader blocked in get(); never block here on a full queue.
+            _offer(queue, None)
 
     async def _add_subscriber(self, channel: str, queue: asyncio.Queue[Event | None]) -> None:
         # The lock makes concurrent first subscribers to a channel wait for one
@@ -252,9 +262,54 @@ class _ChannelLock:
         self.users = 0
 
 
+def _offer(queue: asyncio.Queue[Event | None], item: Event | None) -> None:
+    if isinstance(queue, _SubscriberQueue):
+        queue.offer(item)
+    else:
+        queue.put_nowait(item)
+
+
+class _SubscriberQueue(asyncio.Queue["Event | None"]):
+    """A subscriber's queue; when bounded, a full queue drops its oldest item."""
+
+    _LOG_INTERVAL = 60.0
+
+    def __init__(self, channel: str, max_size: int | None) -> None:
+        super().__init__()  # unbounded: the size limit is enforced in offer()
+        self.channel = channel
+        self.max_size = max_size
+        self.dropped = 0
+        self._dropped_since_log = 0
+        self._last_logged = 0.0
+
+    def offer(self, item: Event | None) -> None:
+        if self.max_size is not None and self.qsize() >= self.max_size:
+            self.get_nowait()
+            self.dropped += 1
+            self._dropped_since_log += 1
+            now = time.monotonic()
+            if self.dropped == 1 or now - self._last_logged >= self._LOG_INTERVAL:
+                logger.warning(
+                    "Subscriber to channel %r is not keeping up (max_queue_size=%d): "
+                    "dropped %d oldest message(s), %d in total",
+                    self.channel,
+                    self.max_size,
+                    self._dropped_since_log,
+                    self.dropped,
+                )
+                self._last_logged = now
+                self._dropped_since_log = 0
+        self.put_nowait(item)
+
+
 class Subscriber:
     def __init__(self, queue: asyncio.Queue[Event | None]) -> None:
         self._queue = queue
+
+    @property
+    def dropped_messages(self) -> int:
+        """Messages dropped because this subscriber's queue was full."""
+        return self._queue.dropped if isinstance(self._queue, _SubscriberQueue) else 0
 
     async def __aiter__(self) -> AsyncGenerator[Event | None, None]:
         try:

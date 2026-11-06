@@ -140,6 +140,21 @@ backends keep working through connection loss:
   seconds, then raises `ConnectionError`. `connect()` still fails immediately if
   the server cannot be reached at startup.
 
+### Slow subscribers
+
+A subscriber's queue is unbounded by default, so a consumer that cannot keep up
+makes memory grow. Pass `max_queue_size` to bound it:
+
+```python
+async with broadcast.subscribe("chatroom", max_queue_size=100) as subscriber:
+    ...
+```
+
+When the queue is full, the oldest queued message is dropped to make room for
+the newest, so the subscriber stays current instead of falling further behind.
+Drops are logged (at most once a minute) and counted in
+`subscriber.dropped_messages`. A slow subscriber never holds up the others.
+
 ### Timeouts and keepalive
 
 * Redis clients created from a URL use `socket_connect_timeout=5` and
