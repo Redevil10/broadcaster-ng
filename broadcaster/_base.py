@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlparse
@@ -42,9 +43,27 @@ class Broadcast:
     # backend anyway.
     _LISTENER_STOP_TIMEOUT = 5.0
 
-    def __init__(self, url: str | None = None, *, backend: BroadcastBackend | None = None) -> None:
+    def __init__(
+        self,
+        url: str | None = None,
+        *,
+        backend: BroadcastBackend | None = None,
+        on_reconnect: Callable[[list[str], float], Awaitable[None] | None] | None = None,
+    ) -> None:
+        """
+        `on_reconnect(channels, downtime)` is called, if given, each time a
+        backend has reconnected after losing its connection (Redis pub/sub and
+        Postgres). Messages published while it was down are lost; `channels` are
+        the re-subscribed channels and `downtime` the outage in seconds. It is
+        called after re-subscribing, so state reloaded in it cannot miss later
+        messages. It may be a plain or an async function; errors are logged.
+        """
         assert url or backend, "Either `url` or `backend` must be provided."
         self._backend = backend or self._create_backend(cast(str, url))
+        self._on_reconnect = on_reconnect
+        self._callback_tasks: set[asyncio.Task[None]] = set()
+        if on_reconnect is not None:
+            self._backend._reconnect_hook = self._handle_reconnect
         self._subscribers: dict[str, set[asyncio.Queue[Event | None]]] = {}
         self._channel_locks: dict[str, _ChannelLock] = {}
         self._listener_task: asyncio.Task[None] | None = None
@@ -105,6 +124,30 @@ class Broadcast:
             elif not task.cancelled() and task.exception() is not None:
                 logger.error("Broadcast listener had stopped with an error", exc_info=task.exception())
         await self._backend.disconnect()
+        for callback_task in list(self._callback_tasks):
+            await stop_task(callback_task, self._LISTENER_STOP_TIMEOUT)
+
+    def _handle_reconnect(self, channels: list[str], downtime: float) -> None:
+        callback = self._on_reconnect
+        if callback is None:
+            return
+        try:
+            result = callback(list(channels), downtime)
+        except Exception:
+            logger.exception("Error in on_reconnect callback")
+            return
+        if inspect.isawaitable(result):
+            # Run async callbacks in their own task so a slow one does not hold
+            # up the backend's reader.
+            task = asyncio.ensure_future(self._await_callback(result))
+            self._callback_tasks.add(task)
+            task.add_done_callback(self._callback_tasks.discard)
+
+    async def _await_callback(self, result: Awaitable[None]) -> None:
+        try:
+            await result
+        except Exception:
+            logger.exception("Error in on_reconnect callback")
 
     async def _listener(self, stop: asyncio.Event) -> None:
         # Supervised loop: an error from the backend must not end the listener,

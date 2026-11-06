@@ -49,6 +49,11 @@ API and the `broadcaster` import name are unchanged.
 
 ### Added
 
+- `Broadcast(..., on_reconnect=callback)`: called with the re-subscribed
+  channels and the outage length after a Redis or Postgres backend
+  reconnects, so applications can reload state that may have been missed.
+  Custom backends can trigger it with `self._notify_reconnect(channels,
+  downtime)`.
 - Logging on the `broadcaster` logger for connection loss, reconnects and
   failed reconnects.
 - Includes the unreleased changes from encode/broadcaster master after 0.3.1:

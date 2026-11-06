@@ -261,11 +261,13 @@ class PostgresBackend(BroadcastBackend):
                     await wait_or_stop(self._stop, delay)
                     continue
                 if self._down_since is not None:
+                    downtime = time.monotonic() - self._down_since
                     logger.warning(
                         "Reconnected to Postgres after %.1f s; notifications sent meanwhile were lost",
-                        time.monotonic() - self._down_since,
+                        downtime,
                     )
                     self._down_since = None
+                    self._notify_reconnect(sorted(self._channels), downtime)
                 failures = 0
                 continue
 

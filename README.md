@@ -119,6 +119,20 @@ backends keep working through connection loss:
   lost. Every reconnect is logged with how long the connection was down. If your
   application cannot tolerate gaps, reload state from your source of truth
   after a reconnect.
+* **Reacting to a reconnect.** Pass `on_reconnect` to get called after a
+  backend has reconnected and re-subscribed:
+
+  ```python
+  async def on_reconnect(channels: list[str], downtime: float) -> None:
+      # Messages published during the last `downtime` seconds were lost.
+      await reload_state(channels)
+
+  broadcast = Broadcast("redis://localhost:6379", on_reconnect=on_reconnect)
+  ```
+
+  It runs after the channels are subscribed again, so state reloaded in it
+  cannot miss later messages. Plain functions are called directly (keep them
+  quick); async functions run in their own task. Errors are logged.
 * **`subscribe()` during an outage** waits for the reconnect for up to 10
   seconds, then raises `ConnectionError`. `connect()` still fails immediately if
   the server cannot be reached at startup.
