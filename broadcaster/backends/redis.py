@@ -314,12 +314,31 @@ StreamMessageType = tuple[bytes, tuple[tuple[bytes, dict[bytes, bytes]]]]
 
 
 class RedisStreamBackend(BroadcastBackend):
+    """Redis Streams backend.
+
+    A stream stores its messages and the backend remembers the last ID it read
+    per stream, so after a connection error (which `Broadcast` logs and
+    retries) reading continues where it stopped: nothing is lost.
+    """
+
+    # Same defaults as RedisBackend; URL query parameters override them.
+    # Without socket_timeout, XREAD on a half-open connection waits forever.
+    _DEFAULT_SOCKET_CONNECT_TIMEOUT = RedisBackend._DEFAULT_SOCKET_CONNECT_TIMEOUT
+    _DEFAULT_SOCKET_TIMEOUT = RedisBackend._DEFAULT_SOCKET_TIMEOUT
+
     def __init__(self, url: str):
         url = url.replace("redis-stream", "redis", 1)
         self.streams: dict[bytes | str | memoryview, int | bytes | str | memoryview] = {}
         self._ready = asyncio.Event()
-        self._producer = redis.Redis.from_url(url)
-        self._consumer = redis.Redis.from_url(url)
+        self._producer = self._client(url)
+        self._consumer = self._client(url)
+
+    def _client(self, url: str) -> redis.Redis:
+        return redis.Redis.from_url(
+            url,
+            socket_connect_timeout=self._DEFAULT_SOCKET_CONNECT_TIMEOUT,
+            socket_timeout=self._DEFAULT_SOCKET_TIMEOUT,
+        )
 
     async def connect(self) -> None:
         pass
@@ -362,8 +381,12 @@ class RedisStreamBackend(BroadcastBackend):
         messages = await self.wait_for_messages()
         stream, events = messages[0]
         _msg_id, message = events[0]
-        self.streams[stream.decode("utf-8")] = _msg_id.decode("utf-8")
+        name = stream.decode("utf-8")
+        # Only if still subscribed: writing it back unconditionally re-added a
+        # stream that was unsubscribed while this message was in flight.
+        if name in self.streams:
+            self.streams[name] = _msg_id.decode("utf-8")
         return Event(
-            channel=stream.decode("utf-8"),
+            channel=name,
             message=message.get(b"message", b"").decode("utf-8"),
         )

@@ -159,9 +159,11 @@ logger (`broadcaster.redis`, `broadcaster.postgres` for the backends): a
 WARNING when a connection is lost and when it is restored, and an ERROR when
 reconnecting fails (repeated failures are logged at most once a minute).
 
-The Redis Streams and Kafka backends do not have their own reconnect logic.
-Errors they raise are logged and retried by `Broadcast`; the Kafka client also
-reconnects by itself.
+The Redis Streams (`redis-stream://`) and Kafka backends recover from
+connection loss too: errors are logged and retried, and the clients reconnect.
+Both store messages, so nothing published during the outage is lost: Redis
+Streams continues from the last message ID it read. Redis Streams clients get
+the same default socket timeouts as Redis pub/sub.
 
 ### Using custom backends
 

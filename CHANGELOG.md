@@ -24,6 +24,10 @@ API and the `broadcaster` import name are unchanged.
 - Redis pub/sub: works with clients created with `decode_responses=True`.
 - Redis Streams: calling `XREAD` with no streams after the last unsubscribe
   (encode/broadcaster#149).
+- Redis Streams: default socket timeouts (5 s, overridable in the URL), so a
+  half-open connection no longer blocks reading forever; a stream unsubscribed
+  while a message was in flight is no longer read again. Messages published
+  during a connection loss are delivered after reconnecting.
 - Postgres: reconnects and re-runs `LISTEN` after connection loss
   (encode/broadcaster#66); detects half-open connections with a heartbeat
   query; concurrent subscribes no longer fail with "another operation is in
