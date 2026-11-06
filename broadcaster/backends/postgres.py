@@ -99,7 +99,9 @@ class PostgresBackend(BroadcastBackend):
         self._stop.clear()
         self._pool = await asyncpg.create_pool(
             self._url,
-            min_size=1,
+            # min_size=0: no idle connection for asyncpg to restore in the
+            # background during an outage (it logs a traceback for each try).
+            min_size=0,
             max_size=self._PUBLISH_POOL_MAX_SIZE,
             timeout=self._CONNECT_TIMEOUT,
             command_timeout=self._COMMAND_TIMEOUT,
