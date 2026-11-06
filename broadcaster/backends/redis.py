@@ -94,6 +94,9 @@ class RedisBackend(BroadcastBackend):
         # SUBSCRIBE, UNSUBSCRIBE and PING do not wait for the reply; the reader expects one
         # (or any other data) by this time, else the connection is dead.
         self._reply_due: float | None = None
+        # subscribe() calls waiting for Redis to confirm SUBSCRIBE: set by the
+        # reader when the confirmation arrives, or when it drops the connection.
+        self._confirmations: dict[str, asyncio.Event] = {}
         self._down_since: float | None = None
 
     async def connect(self) -> None:
@@ -127,13 +130,16 @@ class RedisBackend(BroadcastBackend):
             raise
 
     async def _subscribe(self, channel: str) -> None:
+        confirmed = asyncio.Event()
         async with self._lock:
             pubsub = self._pubsub
             if pubsub is not None:
+                self._confirmations[channel] = confirmed
                 try:
-                    await asyncio.wait_for(pubsub.subscribe(channel), self._COMMAND_TIMEOUT)
+                    # Armed before sending: the reader may see the reply before
+                    # this call returns.
                     self._expect_reply()
-                    return
+                    await asyncio.wait_for(pubsub.subscribe(channel), self._COMMAND_TIMEOUT)
                 except Exception as exc:
                     # Any failure means this connection is unusable; e.g. right
                     # after a reset, before the reader noticed, redis-py raises
@@ -141,6 +147,21 @@ class RedisBackend(BroadcastBackend):
                     logger.warning(
                         "Redis connection lost while subscribing to %r (%s); reconnecting", channel, _describe(exc)
                     )
+                    await self._drop(pubsub)
+                    pubsub = None
+        if pubsub is not None:
+            # SUBSCRIBE does not wait for its reply. Wait for the reader to see
+            # it, so messages published after subscribe() returns are delivered.
+            try:
+                await wait_any([confirmed], self._COMMAND_TIMEOUT)
+            finally:
+                if self._confirmations.get(channel) is confirmed:
+                    del self._confirmations[channel]
+            if self._pubsub is pubsub:
+                if confirmed.is_set():
+                    return
+                logger.warning("No reply from Redis to SUBSCRIBE %r; reconnecting", channel)
+                async with self._lock:
                     await self._drop(pubsub)
         # No live connection: the reader re-subscribes every channel in
         # `_channels` (including this one) when it reconnects. Wait for that,
@@ -161,8 +182,8 @@ class RedisBackend(BroadcastBackend):
             if pubsub is None:
                 return  # nothing to do: a reconnect will not re-subscribe it
             try:
+                self._expect_reply()  # before sending: see subscribe()
                 await asyncio.wait_for(pubsub.unsubscribe(channel), self._COMMAND_TIMEOUT)
-                self._expect_reply()
             except Exception as exc:  # see subscribe()
                 logger.warning(
                     "Redis connection lost while unsubscribing from %r (%s); reconnecting", channel, _describe(exc)
@@ -194,22 +215,47 @@ class RedisBackend(BroadcastBackend):
         try:
             await asyncio.wait_for(pubsub.connect(), self._COMMAND_TIMEOUT)  # type: ignore[no-untyped-call]
             if self._channels:
-                await asyncio.wait_for(pubsub.subscribe(*self._channels), self._COMMAND_TIMEOUT)
+                channels = set(self._channels)
+                await asyncio.wait_for(pubsub.subscribe(*channels), self._COMMAND_TIMEOUT)
+                # Only report the connection as ready (and call on_reconnect)
+                # once Redis has confirmed every SUBSCRIBE.
+                await self._await_confirmations(pubsub, channels)
         except BaseException:
             await self._close(pubsub)
             raise
         self._pubsub = pubsub
         self._last_seen = self._last_ping = time.monotonic()
         self._reply_due = None
-        if self._channels:
-            self._expect_reply()
         self._connected.set()
+
+    async def _await_confirmations(self, pubsub: PubSub, channels: set[str]) -> None:
+        """Read from a new connection until every channel's SUBSCRIBE is confirmed,
+        queueing any message that arrives meanwhile."""
+        deadline = time.monotonic() + self._COMMAND_TIMEOUT
+        while channels:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise redis_exceptions.ConnectionError(
+                    f"no reply from Redis to SUBSCRIBE within {self._COMMAND_TIMEOUT:g} s"
+                )
+            timeout = min(remaining, self._READ_TIMEOUT)
+            message = await asyncio.wait_for(pubsub.get_message(timeout=timeout), timeout + self._COMMAND_TIMEOUT)
+            if message is None:
+                continue
+            if message["type"] == "subscribe":
+                channels.discard(_to_str(message["channel"]))
+            elif message["type"] == "message":
+                self._queue.put_nowait(Event(channel=_to_str(message["channel"]), message=_to_str(message["data"])))
 
     async def _drop(self, pubsub: PubSub) -> None:
         """Forget a broken connection; the reader will open a new one."""
         if self._pubsub is pubsub:
             self._pubsub = None
             self._connected.clear()
+            # Wake subscribe() calls waiting for a confirmation on this connection.
+            for confirmed in self._confirmations.values():
+                confirmed.set()
+            self._confirmations.clear()
             if self._down_since is None:
                 self._down_since = time.monotonic()
         await self._close(pubsub)
@@ -325,6 +371,10 @@ class RedisBackend(BroadcastBackend):
             self._reply_due = None
             if message["type"] == "message":
                 await self._queue.put(Event(channel=_to_str(message["channel"]), message=_to_str(message["data"])))
+            elif message["type"] == "subscribe":
+                confirmed = self._confirmations.pop(_to_str(message["channel"]), None)
+                if confirmed is not None:
+                    confirmed.set()
             return
         if self._reply_due is not None and now >= self._reply_due:
             raise redis_exceptions.ConnectionError(f"no reply from Redis within {self._COMMAND_TIMEOUT:g} s")

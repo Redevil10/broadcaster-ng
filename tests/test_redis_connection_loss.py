@@ -14,6 +14,7 @@ from collections.abc import AsyncIterator, Iterator
 import pytest
 import pytest_asyncio
 from redis import asyncio as redis
+from redis.asyncio.client import PubSub
 
 from broadcaster import Broadcast, Event
 from broadcaster._base import Subscriber
@@ -297,9 +298,9 @@ async def test_disconnect_fails_pending_subscribe_promptly(proxy: TcpProxy) -> N
 async def test_subscribe_on_silently_dead_connection_is_detected_quickly(
     proxy: TcpProxy, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # SUBSCRIBE does not wait for the server's reply. On a silently dead
-    # connection the missing reply must be noticed within the command deadline
-    # (0.5 s here), not only after the much longer silence limit.
+    # On a silently dead connection the missing SUBSCRIBE confirmation must be
+    # noticed within the command deadline (0.5 s here), not only after the
+    # much longer silence limit; subscribe() then completes after the reconnect.
     monkeypatch.setattr(RedisBackend, "_SILENT_LIMIT", 30.0)
     monkeypatch.setattr(RedisBackend, "_PING_AFTER", 30.0)
     with caplog.at_level(logging.WARNING, logger="broadcaster"):
@@ -307,11 +308,17 @@ async def test_subscribe_on_silently_dead_connection_is_detected_quickly(
             async with broadcast.subscribe("other") as other:
                 await publish_until_received(broadcast, other, "other")
                 proxy.mute()
-                async with broadcast.subscribe("chatroom") as subscriber:
-                    await asyncio.sleep(1.0)
-                    assert "no reply from Redis" in caplog.text
-                    proxy.unmute()
-                    await publish_until_received(broadcast, subscriber)
+                subscription = broadcast.subscribe("chatroom")  # keep a reference: closed when collected
+                joining = asyncio.create_task(subscription.__aenter__())
+                await asyncio.sleep(1.0)
+                assert "No reply from Redis to SUBSCRIBE 'chatroom'" in caplog.text
+                assert not joining.done()
+                proxy.unmute()
+                await proxy.reset()  # drop the muted connections
+                subscriber = await asyncio.wait_for(joining, 5)
+                await publish_until_received(broadcast, subscriber)
+                await publish_until_received(broadcast, other, "other")
+                await subscription.__aexit__(None, None, None)
 
 
 @pytest.mark.asyncio
@@ -406,3 +413,62 @@ async def test_connection_lost_right_after_opening_backs_off(monkeypatch: pytest
             await asyncio.sleep(1.0)
     # Backoff 0.05 s doubling to 0.2 s: about 6 attempts, not hundreds.
     assert 1 <= opens <= 10
+
+
+@pytest.mark.asyncio
+async def test_reconnect_is_reported_only_after_redis_confirms_subscriptions(
+    proxy: TcpProxy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The connection used to count as restored (and on_reconnect ran) as soon
+    # as SUBSCRIBE was sent; here the first SUBSCRIBE after the reset never
+    # reaches Redis, so a message published from on_reconnect was lost.
+    calls = 0
+    swallow = False
+    original = PubSub.subscribe
+
+    async def subscribe(self: PubSub, *args: typing.Any, **kwargs: typing.Any) -> typing.Any:
+        nonlocal swallow
+        # Our backend passes str; redis-py's own internal re-subscribe passes bytes.
+        if swallow and all(isinstance(arg, str) for arg in args):
+            swallow = False
+            return None
+        return await original(self, *args, **kwargs)
+
+    async def on_reconnect(channels: list[str], downtime: float) -> None:
+        nonlocal calls
+        calls += 1
+        await broadcast.publish("chatroom", f"after-reconnect-{calls}")
+
+    monkeypatch.setattr(PubSub, "subscribe", subscribe)
+    broadcast = Broadcast(proxied_url(proxy), on_reconnect=on_reconnect)
+    async with broadcast:
+        async with broadcast.subscribe("chatroom") as subscriber:
+            swallow = True
+            await proxy.reset()
+            assert (await asyncio.wait_for(subscriber.get(), 5)).message == "after-reconnect-1"
+            assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_subscribe_reply_read_before_the_call_returns_is_not_awaited_again(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The reader can read the SUBSCRIBE reply before pubsub.subscribe()
+    # returns. The reply deadline used to be armed only then, for a reply
+    # already received, forcing a needless reconnect on an idle connection.
+    monkeypatch.setattr(RedisBackend, "_SILENT_LIMIT", 30.0)
+    monkeypatch.setattr(RedisBackend, "_PING_AFTER", 30.0)
+    original = PubSub.subscribe
+
+    async def slow_to_return(self: PubSub, *args: typing.Any, **kwargs: typing.Any) -> typing.Any:
+        result = await original(self, *args, **kwargs)
+        await asyncio.sleep(0.2)  # the reader reads the reply meanwhile
+        return result
+
+    with caplog.at_level(logging.WARNING, logger="broadcaster"):
+        async with Broadcast("redis://localhost:6379") as broadcast:
+            async with broadcast.subscribe("other"):
+                monkeypatch.setattr(PubSub, "subscribe", slow_to_return)
+                async with broadcast.subscribe("chatroom"):
+                    await asyncio.sleep(1.0)
+    assert caplog.text == ""
