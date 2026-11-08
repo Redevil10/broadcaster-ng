@@ -510,3 +510,60 @@ async def test_cancelled_subscribe_is_undone_on_the_server(monkeypatch: pytest.M
                 assert await direct.pubsub_numsub("other") == [(b"other", 1)]
     finally:
         await direct.aclose()
+
+
+@pytest.mark.asyncio
+async def test_subscribe_timing_out_during_reconnect_is_undone_on_the_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The reconnect re-subscribes a snapshot of the channels that includes one
+    # whose subscribe() then times out: the server must not stay subscribed.
+    monkeypatch.setattr(RedisBackend, "_SUBSCRIBE_TIMEOUT", 0.6)
+    channel = f"late_{uuid.uuid4().hex[:8]}"
+    backend = RedisBackend("redis://localhost:6379")
+    original = RedisBackend._await_confirmations
+
+    async def slow(self: RedisBackend, pubsub: PubSub, channels: set[str]) -> None:
+        await asyncio.sleep(1.0)
+        await original(self, pubsub, channels)
+
+    direct = redis.Redis.from_url("redis://localhost:6379")
+    try:
+        async with Broadcast(backend=backend) as broadcast:
+            async with broadcast.subscribe("other"):
+                monkeypatch.setattr(RedisBackend, "_await_confirmations", slow)
+                async with backend._lock:
+                    assert backend._pubsub is not None
+                    await backend._drop(backend._pubsub)
+                with pytest.raises(ConnectionError, match="could not subscribe"):
+                    async with broadcast.subscribe(channel):
+                        pass  # pragma: no cover
+                await asyncio.wait_for(backend._connected.wait(), 5)
+                for _ in range(50):
+                    if await direct.pubsub_numsub(channel) == [(channel.encode(), 0)]:
+                        break
+                    await asyncio.sleep(0.05)
+                assert await direct.pubsub_numsub(channel) == [(channel.encode(), 0)]
+                assert await direct.pubsub_numsub("other") == [(b"other", 1)]
+    finally:
+        await direct.aclose()
+
+
+@pytest.mark.asyncio
+async def test_subscribe_cancelled_before_sending_leaves_no_pending_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+
+    async def stuck(self: PubSub, *args: typing.Any, **kwargs: typing.Any) -> None:
+        started.set()
+        await asyncio.sleep(10)
+
+    backend = RedisBackend("redis://localhost:6379")
+    async with Broadcast(backend=backend) as broadcast:
+        async with broadcast.subscribe("other"):
+            monkeypatch.setattr(PubSub, "subscribe", stuck)
+            task = asyncio.create_task(backend.subscribe("never_sent"))
+            await started.wait()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            monkeypatch.undo()
+            assert backend._confirmations == {}

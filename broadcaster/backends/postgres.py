@@ -182,10 +182,11 @@ class PostgresBackend(BroadcastBackend):
             # Failed or cancelled: Broadcast will not call unsubscribe() for
             # it, so it must not stay in `_channels` (re-LISTENed forever).
             self._channels.discard(channel)
-            if isinstance(exc, asyncio.CancelledError):
-                # The command may still reach the server (or already has):
-                # undo it once it is done, so the server does not keep
-                # sending this channel's messages.
+            if isinstance(exc, (asyncio.CancelledError, ConnectionError)):
+                # The command may still reach the server (or already has), or
+                # a reconnect in progress may subscribe it: undo it once that
+                # is done, so the server does not keep sending this channel's
+                # messages.
                 self._schedule_release(channel)
             raise
 
