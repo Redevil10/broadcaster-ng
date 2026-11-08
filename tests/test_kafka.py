@@ -127,21 +127,56 @@ async def test_stuck_offset_lookup_times_out_and_restores_the_assignment(monkeyp
     async with Broadcast(backend=backend) as broadcast:
         async with broadcast.subscribe(kept) as subscriber:
             assignment = backend._consumer.assignment()
-            original = backend._consumer.seek_to_end
 
-            async def seek_to_end(*partitions: typing.Any) -> typing.Any:
-                if any(tp.topic == stuck for tp in partitions):
-                    await asyncio.sleep(60)
-                return await original(*partitions)
+            def stall(original: typing.Any) -> typing.Any:
+                async def lookup(*args: typing.Any) -> typing.Any:
+                    partitions = args[0] if args and isinstance(args[0], list) else args
+                    if any(tp.topic == stuck for tp in partitions):
+                        await asyncio.sleep(60)
+                    return await original(*args)
 
-            monkeypatch.setattr(backend._consumer, "seek_to_end", seek_to_end)
+                return lookup
+
+            for name in ("seek_to_end", "end_offsets"):
+                monkeypatch.setattr(backend._consumer, name, stall(getattr(backend._consumer, name)))
+            stuck_subscribe = asyncio.ensure_future(broadcast.subscribe(stuck).__aenter__())
+            # Messages on the kept topic are read while the lookup hangs...
+            await asyncio.sleep(0.5)
+            await broadcast.publish(kept, "during")
+            assert (await asyncio.wait_for(subscriber.get(), 5)).message == "during"
             with pytest.raises(ConnectionError, match="could not start reading topic"):
-                async with broadcast.subscribe(stuck):
-                    pass  # pragma: no cover
+                await stuck_subscribe
             assert backend._consumer.assignment() == assignment
             assert backend._consumer_channels == {kept}
-            await broadcast.publish(kept, "still here")
-            assert (await asyncio.wait_for(subscriber.get(), 5)).message == "still here"
+            # ...and not delivered again when the failed subscribe is undone.
+            await broadcast.publish(kept, "after")
+            assert (await asyncio.wait_for(subscriber.get(), 5)).message == "after"
+
+
+@pytest.mark.asyncio
+async def test_stuck_partition_check_does_not_hold_up_subscriptions(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(KafkaBackend, "_SUBSCRIBE_TIMEOUT", 3.0)
+    monkeypatch.setattr(KafkaBackend, "_PARTITION_REFRESH_INTERVAL", 0.1)
+    backend = KafkaBackend(KAFKA_URL)
+    slow, other = new_topic(), new_topic()
+    async with Broadcast(backend=backend) as broadcast:
+        async with broadcast.subscribe(slow):
+            original = backend._producer.partitions_for
+            checking = asyncio.Event()
+
+            async def partitions_for(topic: str) -> typing.Any:
+                if topic == slow:
+                    checking.set()
+                    await asyncio.sleep(60)
+                return await original(topic)
+
+            monkeypatch.setattr(backend._producer, "partitions_for", partitions_for)
+            await asyncio.wait_for(checking.wait(), 5)
+            started = time.monotonic()
+            async with broadcast.subscribe(other) as subscriber:
+                assert time.monotonic() - started < 1.5
+                await broadcast.publish(other, "hello")
+                assert (await asyncio.wait_for(subscriber.get(), 5)).message == "hello"
 
 
 @pytest.mark.asyncio
