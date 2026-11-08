@@ -100,6 +100,35 @@ async def test_disconnect_cancels_pending_async_callback() -> None:
 
 
 @pytest.mark.asyncio
+async def test_callback_can_disconnect_and_other_callbacks_are_still_stopped() -> None:
+    other_cancelled = asyncio.Event()
+    finished = asyncio.Event()
+    calls = 0
+
+    async def on_reconnect(channels: list[str], downtime: float) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                other_cancelled.set()
+                raise
+        else:
+            await broadcast.disconnect()
+            finished.set()
+
+    backend = ReconnectingBackend("memory://")
+    broadcast = Broadcast(backend=backend, on_reconnect=on_reconnect)
+    await broadcast.connect()
+    backend.simulate_reconnect()
+    await asyncio.sleep(0.01)
+    backend.simulate_reconnect()
+    await asyncio.wait_for(finished.wait(), 2)
+    assert other_cancelled.is_set()
+
+
+@pytest.mark.asyncio
 async def test_no_callback_without_reconnect() -> None:
     calls: list[object] = []
     async with Broadcast("memory://", on_reconnect=lambda *args: calls.append(args)) as broadcast:

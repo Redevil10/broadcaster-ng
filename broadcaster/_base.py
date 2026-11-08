@@ -132,8 +132,10 @@ class Broadcast:
         for cleanup_task in list(self._cleanup_tasks):
             await stop_task(cleanup_task, self._LISTENER_STOP_TIMEOUT)
         await self._backend.disconnect()
+        current = asyncio.current_task()
         for callback_task in list(self._callback_tasks):
-            await stop_task(callback_task, self._LISTENER_STOP_TIMEOUT)
+            if callback_task is not current:  # an on_reconnect callback may call disconnect()
+                await stop_task(callback_task, self._LISTENER_STOP_TIMEOUT)
 
     def _handle_reconnect(self, channels: list[str], downtime: float) -> None:
         callback = self._on_reconnect
