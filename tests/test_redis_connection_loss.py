@@ -567,3 +567,19 @@ async def test_subscribe_cancelled_before_sending_leaves_no_pending_confirmation
             await asyncio.gather(task, return_exceptions=True)
             monkeypatch.undo()
             assert backend._confirmations == {}
+
+
+@pytest.mark.asyncio
+async def test_message_that_is_not_utf8_is_skipped_without_reconnecting(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.WARNING, logger="broadcaster")
+    direct = redis.Redis.from_url("redis://localhost:6379")
+    try:
+        async with Broadcast("redis://localhost:6379") as broadcast:
+            async with broadcast.subscribe("binary") as subscriber:
+                await direct.publish("binary", b"\xff\xfe")
+                await direct.publish("binary", "after")
+                assert (await asyncio.wait_for(subscriber.get(), 5)).message == "after"
+    finally:
+        await direct.aclose()
+    assert "not valid UTF-8" in caplog.text
+    assert "reconnecting" not in caplog.text

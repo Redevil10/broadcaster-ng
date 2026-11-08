@@ -99,6 +99,7 @@ class RedisBackend(BroadcastBackend):
         # reader when the confirmation arrives, or when it drops the connection.
         self._confirmations: dict[str, asyncio.Event] = {}
         self._down_since: float | None = None
+        self._last_decode_warning = -self._LOG_INTERVAL
 
     async def connect(self) -> None:
         # Fail fast if Redis is unreachable at startup (as upstream did);
@@ -268,7 +269,23 @@ class RedisBackend(BroadcastBackend):
             if message["type"] == "subscribe":
                 channels.discard(_to_str(message["channel"]))
             elif message["type"] == "message":
-                self._queue.put_nowait(Event(channel=_to_str(message["channel"]), message=_to_str(message["data"])))
+                event = self._to_event(message)
+                if event is not None:
+                    self._queue.put_nowait(event)
+
+    def _to_event(self, message: dict[str, typing.Any]) -> Event | None:
+        try:
+            return Event(channel=_to_str(message["channel"]), message=_to_str(message["data"]))
+        except UnicodeDecodeError:
+            # Not the connection's fault: skip the message, keep the connection.
+            now = time.monotonic()
+            if now - self._last_decode_warning >= self._LOG_INTERVAL:
+                self._last_decode_warning = now
+                logger.warning(
+                    "Skipping a Redis message on %r that is not valid UTF-8 (logged at most once a minute)",
+                    message["channel"],
+                )
+            return None
 
     async def _drop(self, pubsub: PubSub) -> None:
         """Forget a broken connection; the reader will open a new one."""
@@ -393,7 +410,9 @@ class RedisBackend(BroadcastBackend):
             self._last_seen = now
             self._reply_due = None
             if message["type"] == "message":
-                await self._queue.put(Event(channel=_to_str(message["channel"]), message=_to_str(message["data"])))
+                event = self._to_event(message)
+                if event is not None:
+                    await self._queue.put(event)
             elif message["type"] == "subscribe":
                 confirmed = self._confirmations.pop(_to_str(message["channel"]), None)
                 if confirmed is not None:
