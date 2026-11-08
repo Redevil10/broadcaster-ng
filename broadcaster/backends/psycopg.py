@@ -313,7 +313,9 @@ class PsycopgBackend(BroadcastBackend):
             logger.debug("Error closing Postgres connection", exc_info=True)
 
     def _start_reader(self) -> None:
-        if self._stop.is_set():
+        # A restart timer from a crashed reader can fire after disconnect() and
+        # connect() have started a new one: never run two.
+        if self._stop.is_set() or (self._reader is not None and not self._reader.done()):
             return
         self._reader = asyncio.create_task(self._run())
         self._reader.add_done_callback(self._on_reader_done)

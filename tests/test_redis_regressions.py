@@ -8,6 +8,7 @@ import pytest
 from redis.asyncio.client import PubSub
 
 from broadcaster import Broadcast
+from broadcaster.backends.redis import RedisBackend
 
 
 @pytest.mark.asyncio
@@ -48,3 +49,32 @@ async def test_redis_stream_resubscribe_after_last_unsubscribe(caplog: pytest.Lo
                 await broadcast.publish("chatroom", "second")
                 assert (await asyncio.wait_for(subscriber.get(), 5)).message == "second"
     assert caplog.text == ""
+
+
+@pytest.mark.asyncio
+async def test_reader_restart_after_reconnecting_the_backend_does_not_start_a_second_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(RedisBackend, "_READER_RESTART_DELAY", 0.3)
+    backend = RedisBackend("redis://localhost:6379")
+    original = RedisBackend._run
+    crashed = False
+
+    async def crash_once(self: RedisBackend) -> None:
+        nonlocal crashed
+        if not crashed:
+            crashed = True
+            raise RuntimeError("reader bug")
+        await original(self)
+
+    monkeypatch.setattr(RedisBackend, "_run", crash_once)
+    await backend.connect()
+    await asyncio.sleep(0.05)  # the reader crashes; its restart is scheduled
+    await backend.disconnect()
+    await backend.connect()
+    try:
+        await asyncio.sleep(0.5)  # past the restart delay
+        readers = [t for t in asyncio.all_tasks() if getattr(t.get_coro(), "__name__", "") == "crash_once"]
+        assert len(readers) == 1
+    finally:
+        await backend.disconnect()
