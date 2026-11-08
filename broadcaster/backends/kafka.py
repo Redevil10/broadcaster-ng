@@ -40,11 +40,16 @@ class KafkaBackend(BroadcastBackend):
         self._refresher: asyncio.Task[None] | None = None
 
     async def connect(self) -> None:
+        # connect() may run on a different event loop than earlier calls, e.g.
+        # in tests; asyncio primitives bind to the first loop that waits on
+        # them, so start with new ones.
+        self._ready = asyncio.Event()
+        self._lock = asyncio.Lock()
+        self._stop = asyncio.Event()
         self._producer = AIOKafkaProducer(bootstrap_servers=self._servers)  # pyright: ignore
         self._consumer = AIOKafkaConsumer(bootstrap_servers=self._servers)  # pyright: ignore
         await self._producer.start()
         await self._consumer.start()
-        self._stop.clear()
         self._refresher = asyncio.create_task(self._refresh_partitions())
 
     async def disconnect(self) -> None:

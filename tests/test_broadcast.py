@@ -147,3 +147,33 @@ async def test_unknown_backend():
 async def test_needs_url_or_backend():
     with pytest.raises(AssertionError, match="Either `url` or `backend` must be provided."):
         Broadcast()
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "redis://localhost:6379",
+        "redis-stream://localhost:6379",
+        POSTGRES_URL,
+        POSTGRES_URL.replace("postgres://", "postgres+psycopg://", 1),
+        "kafka://localhost:9092",
+    ],
+    ids=["redis", "redis-stream", "postgres", "psycopg", "kafka"],
+)
+def test_reconnect_on_a_new_event_loop(url: str, caplog: pytest.LogCaptureFixture) -> None:
+    # E.g. one Broadcast shared by tests that each get their own event loop.
+    # Primitives bound to the old loop made every read fail (logged, retried).
+    broadcast = Broadcast(url)
+    channel = f"loop_{os.urandom(4).hex()}"
+
+    async def round_trip() -> None:
+        async with broadcast:
+            async with broadcast.subscribe(channel) as subscriber:
+                await broadcast.publish(channel, "hello")
+                event = await asyncio.wait_for(subscriber.get(), 10)
+                assert event.message == "hello"
+
+    asyncio.run(round_trip())
+    asyncio.run(round_trip())
+    assert "Error reading from the broadcast backend" not in caplog.text
+    assert "different event loop" not in caplog.text

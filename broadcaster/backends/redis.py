@@ -104,7 +104,17 @@ class RedisBackend(BroadcastBackend):
     async def connect(self) -> None:
         # Fail fast if Redis is unreachable at startup (as upstream did);
         # later connection loss is handled by reconnecting.
-        self._stop.clear()
+        # connect() may run on a different event loop than earlier calls, e.g.
+        # in tests; asyncio primitives bind to the first loop that waits on
+        # them, so start with new ones.
+        self._has_channels = asyncio.Event()
+        if self._channels:
+            self._has_channels.set()
+        self._connected = asyncio.Event()
+        self._lock = asyncio.Lock()
+        self._queue = asyncio.Queue()
+        self._stop = asyncio.Event()
+        self._confirmations = {}
         async with self._lock:
             await self._open()
         self._start_reader()
@@ -467,7 +477,10 @@ class RedisStreamBackend(BroadcastBackend):
         return client
 
     async def connect(self) -> None:
-        pass
+        # A new event loop may be running: see RedisBackend.connect().
+        self._ready = asyncio.Event()
+        if self.streams:
+            self._ready.set()
 
     async def disconnect(self) -> None:
         await self._producer.aclose()

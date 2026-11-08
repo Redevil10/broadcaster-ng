@@ -151,7 +151,14 @@ class PsycopgBackend(BroadcastBackend):
 
     async def connect(self) -> None:
         # Fail fast if Postgres is unreachable at startup.
-        self._stop.clear()
+        # connect() may run on a different event loop than earlier calls, e.g.
+        # in tests; asyncio primitives bind to the first loop that waits on
+        # them, so start with new ones.
+        self._connected = asyncio.Event()
+        self._lock = asyncio.Lock()
+        self._publish_lock = asyncio.Lock()
+        self._listen_queue = asyncio.Queue()
+        self._stop = asyncio.Event()
         async with self._lock:
             await self._open()
         self._start_reader()

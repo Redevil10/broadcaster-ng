@@ -135,7 +135,14 @@ class PostgresBackend(BroadcastBackend):
 
     async def connect(self) -> None:
         # Fail fast if Postgres is unreachable at startup.
-        self._stop.clear()
+        # connect() may run on a different event loop than earlier calls, e.g.
+        # in tests; asyncio primitives bind to the first loop that waits on
+        # them, so start with new ones.
+        self._connected = asyncio.Event()
+        self._lock = asyncio.Lock()
+        self._wake = asyncio.Event()
+        self._listen_queue = asyncio.Queue()
+        self._stop = asyncio.Event()
         self._pool = await asyncpg.create_pool(
             self._url,
             # min_size=0: no idle connection for asyncpg to restore in the
