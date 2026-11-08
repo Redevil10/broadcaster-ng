@@ -45,8 +45,9 @@ API and the `broadcaster` import name are unchanged.
   appears instead of waiting forever.
 - Kafka: a slow or missing topic no longer holds up subscription changes on
   other channels; the whole `subscribe()` is bounded by the 10 s timeout and
-  a failed one restores the consumer's previous assignment. Partitions added
-  to a subscribed topic are picked up within a minute.
+  a failed one restores the consumer's previous assignment without
+  re-delivering messages on the other channels. Partitions added to a
+  subscribed topic are picked up within a minute.
 - Leaving a subscription completes even when the task is cancelled during
   cleanup (anyio/Starlette cancel every await in it): the queue is
   deregistered and the backend unsubscribed. A cancelled subscribe is undone
@@ -63,6 +64,12 @@ API and the `broadcaster` import name are unchanged.
   system default, as in libpq, instead of failing on Linux.
 - `disconnect()` stops the listener reliably, even when a client library
   swallows the cancellation (redis-py 8 on Python 3.11).
+- `connect()` after `disconnect()` works on a new event loop (e.g. one
+  `Broadcast` shared by tests that each get their own loop).
+- Redis pub/sub: a message that is not valid UTF-8 is skipped with a warning
+  instead of forcing a reconnect that lost messages on every channel.
+- `on_reconnect` reports only the channels the reconnect restored, and may
+  call `disconnect()` itself.
 
 ### Changed
 
