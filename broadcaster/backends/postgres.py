@@ -267,8 +267,8 @@ class PostgresBackend(BroadcastBackend):
     async def _init_publish_connection(self, conn: asyncpg.Connection) -> None:
         _apply_keepalive(conn, self._keepalive)
 
-    async def _open(self) -> None:
-        """Open a new LISTEN connection and LISTEN every wanted channel.
+    async def _open(self) -> list[str]:
+        """Open a new LISTEN connection and LISTEN every wanted channel; return them.
 
         Must be called with `_lock` held.
         """
@@ -281,7 +281,8 @@ class PostgresBackend(BroadcastBackend):
         try:
             _apply_keepalive(conn, self._keepalive)
             conn.add_termination_listener(self._on_termination)
-            for channel in list(self._channels):
+            channels = sorted(self._channels)
+            for channel in channels:
                 await asyncio.wait_for(conn.add_listener(channel, self._listener), self._COMMAND_TIMEOUT)
         except BaseException:
             conn.terminate()
@@ -290,6 +291,7 @@ class PostgresBackend(BroadcastBackend):
         self._conn = conn
         self._last_seen = time.monotonic()
         self._connected.set()
+        return channels
 
     def _is_current(self, conn: asyncpg.Connection) -> bool:
         return self._conn is conn
@@ -353,10 +355,11 @@ class PostgresBackend(BroadcastBackend):
                         await wait_or_stop(self._stop, self._backoff(failures))
                         continue
                     failures = 0
+                replayed: list[str] = []
                 try:
                     async with self._lock:
                         if self._conn is None:
-                            await self._open()
+                            replayed = await self._open()
                 except Exception as exc:
                     if self._stop.is_set():
                         return
@@ -377,7 +380,9 @@ class PostgresBackend(BroadcastBackend):
                         downtime,
                     )
                     self._down_since = None
-                    self._notify_reconnect(sorted(self._channels), downtime)
+                    # Only channels whose subscription this reconnect restored: one
+                    # joining meanwhile is not subscribed yet.
+                    self._notify_reconnect([c for c in replayed if c in self._channels], downtime)
                 attempts = 0
                 connected_at = time.monotonic()
                 continue

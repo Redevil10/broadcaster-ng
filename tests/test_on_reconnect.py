@@ -171,3 +171,29 @@ async def test_postgres_calls_on_reconnect_after_resubscribing(fast_timings: Non
 
     assert urlsplit(POSTGRES_URL).scheme.startswith("postgres")
     await _check_real_reconnect(POSTGRES_URL, terminate_listener)
+
+
+@pytest.mark.asyncio
+async def test_redis_reports_only_channels_the_reconnect_restored(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A channel joining while the reconnect re-subscribes is not subscribed
+    # on the new connection yet, so it must not be reported as restored.
+    reports: list[list[str]] = []
+    backend = RedisBackend("redis://localhost:6379")
+    original = RedisBackend._await_confirmations
+    replaying = asyncio.Event()
+
+    async def slow(self: RedisBackend, pubsub: object, channels: set[str]) -> None:
+        replaying.set()
+        await asyncio.sleep(0.5)
+        await original(self, pubsub, channels)  # type: ignore[arg-type]
+
+    async with Broadcast(backend=backend, on_reconnect=lambda channels, _: reports.append(channels)) as broadcast:
+        async with broadcast.subscribe("restored"):
+            monkeypatch.setattr(RedisBackend, "_await_confirmations", slow)
+            async with backend._lock:
+                assert backend._pubsub is not None
+                await backend._drop(backend._pubsub)
+            await asyncio.wait_for(replaying.wait(), 5)
+            async with broadcast.subscribe("joined"):
+                pass
+            assert reports == [["restored"]]

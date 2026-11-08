@@ -230,20 +230,20 @@ class RedisBackend(BroadcastBackend):
         if not self._channels:
             self._has_channels.clear()
 
-    async def _open(self) -> None:
-        """Open a new pub/sub connection and subscribe every wanted channel.
+    async def _open(self) -> list[str]:
+        """Open a new pub/sub connection and subscribe every wanted channel; return them.
 
         Must be called with `_lock` held.
         """
         pubsub = self._conn.pubsub()
         try:
             await asyncio.wait_for(pubsub.connect(), self._COMMAND_TIMEOUT)  # type: ignore[no-untyped-call]
-            if self._channels:
-                channels = set(self._channels)
+            channels = sorted(self._channels)
+            if channels:
                 await asyncio.wait_for(pubsub.subscribe(*channels), self._COMMAND_TIMEOUT)
                 # Only report the connection as ready (and call on_reconnect)
                 # once Redis has confirmed every SUBSCRIBE.
-                await self._await_confirmations(pubsub, channels)
+                await self._await_confirmations(pubsub, set(channels))
         except BaseException:
             await self._close(pubsub)
             raise
@@ -251,6 +251,7 @@ class RedisBackend(BroadcastBackend):
         self._last_seen = self._last_ping = time.monotonic()
         self._reply_due = None
         self._connected.set()
+        return channels
 
     async def _await_confirmations(self, pubsub: PubSub, channels: set[str]) -> None:
         """Read from a new connection until every channel's SUBSCRIBE is confirmed,
@@ -348,10 +349,11 @@ class RedisBackend(BroadcastBackend):
                         await wait_or_stop(self._stop, self._backoff(failures))
                         continue
                     failures = 0
+                replayed: list[str] = []
                 try:
                     async with self._lock:
                         if self._pubsub is None:
-                            await self._open()
+                            replayed = await self._open()
                 except Exception as exc:
                     if self._stop.is_set():
                         return
@@ -375,7 +377,9 @@ class RedisBackend(BroadcastBackend):
                         downtime,
                     )
                     self._down_since = None
-                    self._notify_reconnect(sorted(self._channels), downtime)
+                    # Only channels whose subscription this reconnect restored: one
+                    # joining meanwhile is not subscribed yet.
+                    self._notify_reconnect([c for c in replayed if c in self._channels], downtime)
                 attempts = 0
                 connected_at = time.monotonic()
                 continue
