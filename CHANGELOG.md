@@ -4,7 +4,7 @@ All notable changes to broadcaster-ng. It continues from
 [encode/broadcaster](https://github.com/encode/broadcaster) 0.3.1; the public
 API and the `broadcaster` import name are unchanged.
 
-## 0.4.0 (2026-11-06)
+## 0.4.0 (2026-11-09)
 
 ### Fixed
 
