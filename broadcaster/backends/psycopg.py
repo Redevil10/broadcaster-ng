@@ -1,0 +1,418 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import time
+from collections.abc import Awaitable
+from typing import Any, TypeVar
+
+import psycopg
+from psycopg import sql
+from psycopg.conninfo import conninfo_to_dict
+
+from .._base import Event
+from .._utils import stop_task, wait_any, wait_or_stop
+from .base import BroadcastBackend
+
+logger = logging.getLogger("broadcaster.psycopg")
+
+T = TypeVar("T")
+Connection = psycopg.AsyncConnection[tuple[object, ...]]
+
+
+def _kill(conn: Connection) -> None:
+    """Close the connection's socket at once, failing any pending query."""
+    try:
+        conn.pgconn.finish()
+    except Exception:
+        logger.debug("Error closing Postgres connection", exc_info=True)
+
+
+async def _with_deadline(conn: Connection, awaitable: Awaitable[T], timeout: float) -> T:
+    """Run a command on `conn`, closing the connection if it takes too long.
+
+    Not asyncio.wait_for(): cancelling a psycopg query sends a cancel request
+    to the server and waits up to 10 s for it, which on a half-open connection
+    never arrives. Closing the socket ends the pending query at once; the
+    connection is broken anyway.
+
+    If the caller is cancelled, the command is left to finish in the
+    background (the connection may be shared: the LISTEN connection serves
+    every channel), still closing the connection if it overruns the deadline.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    task = asyncio.ensure_future(awaitable)
+    task.add_done_callback(lambda t: t.cancelled() or t.exception())  # retrieve it
+    try:
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+    except asyncio.CancelledError:
+
+        def expire() -> None:
+            if not task.done():
+                _kill(conn)
+
+        watchdog = loop.call_at(deadline, expire)
+        task.add_done_callback(lambda _: watchdog.cancel())
+        raise
+    if not done:
+        _kill(conn)
+        await asyncio.wait({task}, timeout=1.0)
+        raise TimeoutError(f"no reply from Postgres within {timeout:g} s")
+    return task.result()
+
+
+def _check_channel(channel: str) -> None:
+    # Rejected by the server or the driver; caught here so the error is clear.
+    if not channel or "\x00" in channel:
+        raise ValueError(f"invalid Postgres channel name: {channel!r}")
+
+
+def _is_server_error(exc: BaseException, conn: Connection) -> bool:
+    """True if the server rejected the command and the connection is fine."""
+    sqlstate = exc.sqlstate if isinstance(exc, psycopg.Error) else None
+    return (
+        sqlstate is not None
+        and not sqlstate.startswith(("08", "57"))  # connection exception / operator intervention
+        and not conn.closed
+    )
+
+
+def _describe(exc: BaseException) -> str:
+    text = str(exc).strip().splitlines()[0] if str(exc).strip() else ""
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
+def _libpq_url(url: str) -> str:
+    """postgres+psycopg://... or postgresql+psycopg://... -> postgresql://..."""
+    # Replace only the scheme: a urlsplit/urlunsplit round trip would turn
+    # postgres+psycopg:///db (the Unix-socket form) into postgresql:/db.
+    return "postgresql" + url[url.index(":") :]
+
+
+class PsycopgBackend(BroadcastBackend):
+    """Postgres LISTEN/NOTIFY backend using psycopg 3 instead of asyncpg.
+
+    Selected with a `postgres+psycopg://` or `postgresql+psycopg://` URL. Same
+    behaviour as the asyncpg backend: one reader task owns the LISTEN
+    connection, reconnects (re-running LISTEN for every channel that still has
+    subscribers), and runs a heartbeat query when idle so a half-open connection
+    is detected. libpq handles the `keepalives*` URL parameters itself.
+    Publishing uses a separate connection. Notifications sent while
+    disconnected are lost (NOTIFY is not stored).
+    """
+
+    _CONNECT_TIMEOUT = 5.0
+    _COMMAND_TIMEOUT = 5.0  # deadline for LISTEN / UNLISTEN / heartbeat / NOTIFY
+    _READ_TIMEOUT = 0.1  # one notifies() slice; commands wait at most this long for the reader
+    _HEARTBEAT_AFTER = 10.0  # run the heartbeat after this long without a notification
+    _SUBSCRIBE_TIMEOUT = 10.0  # how long subscribe() waits for an outage to end
+    _RECONNECT_BACKOFF_INITIAL = 0.2
+    _RECONNECT_BACKOFF_MAX = 5.0
+    _LOG_INTERVAL = 60.0
+    _STOP_TIMEOUT = 5.0
+    # A connection lost sooner than this after opening counts as a failed
+    # attempt, so a server that accepts and then drops connections gets backoff.
+    _STABLE_AFTER = 10.0
+    _READER_RESTART_DELAY = 1.0
+    _APPLICATION_NAME = "broadcaster-listener"
+
+    def __init__(self, url: str):
+        self._url = _libpq_url(url)
+        # Settings given in the URL (or libpq's environment variables) win over
+        # our defaults.
+        params = conninfo_to_dict(self._url)
+        self._name_connections = "application_name" not in params and "PGAPPNAME" not in os.environ
+        user_timeout = params.get("connect_timeout") or os.environ.get("PGCONNECT_TIMEOUT")
+        self._connect_kwargs: dict[str, Any] = {}
+        self._connect_deadline = self._CONNECT_TIMEOUT
+        if user_timeout:
+            # Let libpq apply the user's timeout; only add a safety margin.
+            self._connect_deadline = max(self._CONNECT_TIMEOUT, float(user_timeout) + 1)
+        else:
+            self._connect_kwargs["connect_timeout"] = max(1, round(self._CONNECT_TIMEOUT))
+        # Channels that currently have subscribers: what to (re)LISTEN.
+        self._channels: set[str] = set()
+        # The live LISTEN connection, or None while disconnected. Invariant:
+        # `_connected` is set exactly when `_conn` is not None, and then every
+        # channel in `_channels` has been LISTENed on it.
+        self._conn: Connection | None = None
+        self._connected = asyncio.Event()
+        self._lock = asyncio.Lock()  # serialises LISTEN/UNLISTEN/heartbeat and connection swaps
+        self._publish_conn: Connection | None = None
+        self._publish_lock = asyncio.Lock()
+        self._listen_queue: asyncio.Queue[Event] = asyncio.Queue()
+        self._stop = asyncio.Event()
+        self._release_tasks: set[asyncio.Task[None]] = set()
+        self._reader: asyncio.Task[None] | None = None
+        self._last_seen = 0.0
+        self._down_since: float | None = None
+
+    async def connect(self) -> None:
+        # Fail fast if Postgres is unreachable at startup.
+        # connect() may run on a different event loop than earlier calls, e.g.
+        # in tests; asyncio primitives bind to the first loop that waits on
+        # them, so start with new ones.
+        self._connected = asyncio.Event()
+        self._lock = asyncio.Lock()
+        self._publish_lock = asyncio.Lock()
+        self._listen_queue = asyncio.Queue()
+        self._stop = asyncio.Event()
+        async with self._lock:
+            await self._open()
+        self._start_reader()
+
+    async def disconnect(self) -> None:
+        self._stop.set()
+        for task in list(self._release_tasks):
+            await stop_task(task, self._STOP_TIMEOUT)
+        reader, self._reader = self._reader, None
+        if reader is not None and not await stop_task(reader, self._STOP_TIMEOUT):
+            logger.warning("Postgres reader did not stop within %g s", self._STOP_TIMEOUT)
+        conn, self._conn = self._conn, None
+        self._connected.clear()
+        if conn is not None:
+            await self._close(conn)
+        publish_conn, self._publish_conn = self._publish_conn, None
+        if publish_conn is not None:
+            await self._close(publish_conn)
+
+    async def subscribe(self, channel: str) -> None:
+        _check_channel(channel)
+        self._channels.add(channel)
+        try:
+            await self._subscribe(channel)
+        except BaseException as exc:
+            # Failed or cancelled: Broadcast will not call unsubscribe() for
+            # it, so it must not stay in `_channels` (re-LISTENed forever).
+            self._channels.discard(channel)
+            if isinstance(exc, (asyncio.CancelledError, ConnectionError)):
+                # The command may still reach the server (or already has), or
+                # a reconnect in progress may subscribe it: undo it once that
+                # is done, so the server does not keep sending this channel's
+                # messages.
+                self._schedule_release(channel)
+            raise
+
+    async def _subscribe(self, channel: str) -> None:
+        async with self._lock:
+            conn = self._conn
+            if conn is not None:
+                try:
+                    await _with_deadline(conn, self._execute(conn, "LISTEN", channel), self._COMMAND_TIMEOUT)
+                    return
+                except Exception as exc:
+                    if _is_server_error(exc, conn):
+                        raise  # e.g. a rejected channel name: not a connection problem
+                    logger.warning(
+                        "Postgres connection lost while subscribing to %r (%s); reconnecting", channel, _describe(exc)
+                    )
+                    await self._drop(conn)
+        # No live connection: the reader LISTENs every channel in `_channels`
+        # (including this one) when it reconnects. Wait for that, within a bound,
+        # and stop waiting when the backend is being disconnected.
+        await wait_any([self._connected, self._stop], self._SUBSCRIBE_TIMEOUT)
+        if self._stop.is_set() or not self._connected.is_set():
+            if self._stop.is_set():
+                raise ConnectionError(f"Postgres backend is disconnecting: could not subscribe to {channel!r}")
+            raise ConnectionError(
+                f"Postgres is unavailable: could not subscribe to {channel!r} within {self._SUBSCRIBE_TIMEOUT:g} s"
+            )
+
+    async def unsubscribe(self, channel: str) -> None:
+        self._channels.discard(channel)
+        await self._send_unsubscribe(channel)
+
+    def _schedule_release(self, channel: str) -> None:
+        if self._stop.is_set():
+            return
+        task = asyncio.ensure_future(self._send_unsubscribe(channel, release=True))
+        self._release_tasks.add(task)
+        task.add_done_callback(self._release_tasks.discard)
+
+    async def _send_unsubscribe(self, channel: str, release: bool = False) -> None:
+        async with self._lock:
+            if channel in self._channels:
+                return  # subscribed again meanwhile
+            conn = self._conn
+            if conn is None:
+                return  # a reconnect will not LISTEN it again
+            try:
+                await _with_deadline(conn, self._execute(conn, "UNLISTEN", channel), self._COMMAND_TIMEOUT)
+            except Exception as exc:
+                logger.warning(
+                    "Postgres connection lost while unsubscribing from %r (%s); reconnecting", channel, _describe(exc)
+                )
+                await self._drop(conn)
+
+    async def publish(self, channel: str, message: str) -> None:
+        # A separate connection, so publishing does not queue behind (or get
+        # stuck with) the LISTEN connection. Reopened after a failure.
+        async with self._publish_lock:
+            conn = self._publish_conn
+            if conn is None or conn.closed:
+                conn = self._publish_conn = await self._new_connection(application_name="broadcaster-publisher")
+            try:
+                await _with_deadline(
+                    conn, conn.execute("SELECT pg_notify(%s, %s)", (channel, message)), self._COMMAND_TIMEOUT
+                )
+            except Exception:
+                self._publish_conn = None
+                await self._close(conn)
+                raise
+
+    async def next_published(self) -> Event:
+        return await self._listen_queue.get()
+
+    @staticmethod
+    async def _execute(conn: Connection, command: str, channel: str) -> None:
+        await conn.execute(sql.SQL(command + " {}").format(sql.Identifier(channel)))
+
+    async def _new_connection(self, application_name: str) -> Connection:
+        kwargs = dict(self._connect_kwargs)
+        if self._name_connections:
+            kwargs["application_name"] = application_name
+        return await asyncio.wait_for(
+            psycopg.AsyncConnection.connect(
+                self._url,
+                autocommit=True,  # a LISTEN connection must not sit in a transaction
+                **kwargs,
+            ),
+            self._connect_deadline,
+        )
+
+    async def _open(self) -> list[str]:
+        """Open a new LISTEN connection and LISTEN every wanted channel; return them.
+
+        Must be called with `_lock` held.
+        """
+        conn = await self._new_connection(application_name=self._APPLICATION_NAME)
+        try:
+            channels = sorted(self._channels)
+            for channel in channels:
+                await _with_deadline(conn, self._execute(conn, "LISTEN", channel), self._COMMAND_TIMEOUT)
+        except BaseException:
+            await self._close(conn)
+            raise
+        self._conn = conn
+        self._last_seen = time.monotonic()
+        self._connected.set()
+        return channels
+
+    def _is_current(self, conn: Connection) -> bool:
+        return self._conn is conn
+
+    async def _drop(self, conn: Connection) -> None:
+        """Forget a broken connection; the reader will open a new one."""
+        if self._is_current(conn):
+            self._conn = None
+            self._connected.clear()
+            if self._down_since is None:
+                self._down_since = time.monotonic()
+        await self._close(conn)
+
+    async def _close(self, conn: Connection) -> None:
+        # Closing a half-open connection must not block: bound it.
+        try:
+            await asyncio.wait_for(conn.close(), self._COMMAND_TIMEOUT)
+        except Exception:
+            logger.debug("Error closing Postgres connection", exc_info=True)
+
+    def _start_reader(self) -> None:
+        # A restart timer from a crashed reader can fire after disconnect() and
+        # connect() have started a new one: never run two.
+        if self._stop.is_set() or (self._reader is not None and not self._reader.done()):
+            return
+        self._reader = asyncio.create_task(self._run())
+        self._reader.add_done_callback(self._on_reader_done)
+
+    def _on_reader_done(self, task: asyncio.Task[None]) -> None:
+        # The reader handles connection errors itself and only returns when
+        # stopped. If it ever ends otherwise (a bug), say so and restart it.
+        if task.cancelled() or self._stop.is_set() or task is not self._reader:
+            return
+        logger.error(
+            "Postgres reader stopped unexpectedly; restarting in %g s",
+            self._READER_RESTART_DELAY,
+            exc_info=task.exception(),
+        )
+        asyncio.get_running_loop().call_later(self._READER_RESTART_DELAY, self._start_reader)
+
+    def _backoff(self, failures: int) -> float:
+        return min(self._RECONNECT_BACKOFF_INITIAL * 2.0 ** min(failures - 1, 16), self._RECONNECT_BACKOFF_MAX)
+
+    async def _run(self) -> None:
+        failures = 0  # for the backoff; includes connections lost right after opening
+        attempts = 0  # failed reconnect attempts since the last successful one, for the log
+        last_logged = 0.0
+        connected_at: float | None = time.monotonic()  # the connection opened by connect()
+        while not self._stop.is_set():
+            conn = self._conn
+            if conn is None:
+                if connected_at is not None:
+                    # The connection was just lost.
+                    lived = time.monotonic() - connected_at
+                    connected_at = None
+                    if lived < self._STABLE_AFTER:
+                        failures += 1
+                        await wait_or_stop(self._stop, self._backoff(failures))
+                        continue
+                    failures = 0
+                replayed: list[str] = []
+                try:
+                    async with self._lock:
+                        if self._conn is None:
+                            replayed = await self._open()
+                except Exception as exc:
+                    if self._stop.is_set():
+                        return
+                    failures += 1
+                    attempts += 1
+                    now = time.monotonic()
+                    if attempts == 1 or now - last_logged >= self._LOG_INTERVAL:
+                        logger.error(
+                            "Could not reconnect to Postgres (attempt %d): %s; retrying", attempts, _describe(exc)
+                        )
+                        last_logged = now
+                    await wait_or_stop(self._stop, self._backoff(failures))
+                    continue
+                if self._down_since is not None:
+                    downtime = time.monotonic() - self._down_since
+                    logger.warning(
+                        "Reconnected to Postgres after %.1f s; notifications sent meanwhile were lost", downtime
+                    )
+                    self._down_since = None
+                    # Only channels whose subscription this reconnect restored: one
+                    # joining meanwhile is not subscribed yet.
+                    self._notify_reconnect([c for c in replayed if c in self._channels], downtime)
+                attempts = 0
+                connected_at = time.monotonic()
+                continue
+
+            try:
+                async for notify in conn.notifies(timeout=self._READ_TIMEOUT):
+                    self._last_seen = time.monotonic()
+                    self._listen_queue.put_nowait(Event(channel=notify.channel, message=notify.payload))
+                if time.monotonic() - self._last_seen >= self._HEARTBEAT_AFTER:
+                    await self._heartbeat(conn)
+            except Exception as exc:
+                if self._stop.is_set():
+                    return
+                logger.warning("Lost connection to Postgres (%s); reconnecting", _describe(exc))
+                async with self._lock:
+                    await self._drop(conn)
+
+    async def _heartbeat(self, conn: Connection) -> None:
+        async with self._lock:
+            if not self._is_current(conn):
+                return
+            try:
+                await _with_deadline(conn, conn.execute("SELECT 1"), self._COMMAND_TIMEOUT)
+            except Exception as exc:
+                if self._stop.is_set():
+                    return
+                logger.warning("Postgres heartbeat failed (%s); reconnecting", _describe(exc))
+                await self._drop(conn)
+                return
+            self._last_seen = time.monotonic()

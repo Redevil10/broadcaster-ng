@@ -1,0 +1,29 @@
+# Git hooks, run with prek (https://github.com/j178/prek), a drop-in
+# replacement for pre-commit. Install once with: prek install
+# tests_upstream/ holds byte-identical copies of upstream test files: never modify.
+exclude = "^tests_upstream/"
+
+[[repos]]
+repo = "https://github.com/pre-commit/pre-commit-hooks"
+rev = "v6.0.0"
+hooks = [
+    { id = "check-ast" },
+    { id = "check-yaml" },
+    { id = "check-toml" },
+    { id = "check-json" },
+    { id = "end-of-file-fixer" },
+    { id = "mixed-line-ending" },
+    { id = "trailing-whitespace" },
+    { id = "detect-private-key" },
+    { id = "check-added-large-files" },
+    { id = "check-merge-conflict" },
+]
+
+[[repos]]
+# Same ruff version as requirements.txt and the Lint workflow.
+repo = "https://github.com/astral-sh/ruff-pre-commit"
+rev = "v0.17.4"
+hooks = [
+    { id = "ruff-check", args = ["--fix"] },
+    { id = "ruff-format" },
+]

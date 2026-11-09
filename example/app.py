@@ -1,6 +1,5 @@
 import os
 
-
 import anyio
 from starlette.applications import Starlette
 from starlette.routing import Route, WebSocketRoute
@@ -51,5 +50,7 @@ routes = [
 
 
 app = Starlette(
-    routes=routes, on_startup=[broadcast.connect], on_shutdown=[broadcast.disconnect],
+    routes=routes,
+    on_startup=[broadcast.connect],
+    on_shutdown=[broadcast.disconnect],
 )
