@@ -2,7 +2,7 @@
 
 # Documentation
 mkdocs==1.5.3
-mkdocs-material==9.5.12
+mkdocs-material==9.7.7
 mkautodoc==0.2.0
 
 # Packaging
